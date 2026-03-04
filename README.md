@@ -19,4 +19,5 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 * `std::thread, std::mutex, and std::atomic.` found in C++14 (C++17 recommended).
 <div align="center">
   <video src="https://github.com/user-attachments/assets/826a084e-be17-4036-846a-01234cc155e5" width="800" controls></video>
+  <p><i>Demo: Controlling a Remote Desktop Session</i></p>
 </div>
