@@ -8,9 +8,8 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 * Injects received mouse and keyboard commands into the system.
 
 ### Dashboard
-* Provides a GUI to enter the target Host IP and your connection name.
-* Displays the incoming desktop stream.
-* Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes seamlessly and forward them to the host.
+* GUI to enter the target Host IP and your connection name.
+* Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the client.
 
 ## Building
 ### Compiler: Microsoft Visual C++ (MSVC) is highly recommended.
