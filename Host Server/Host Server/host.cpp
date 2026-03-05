@@ -13,6 +13,9 @@
 #include <shellapi.h>
 #include <gdiplus.h>
 using namespace Gdiplus;
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <avrt.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,6 +31,7 @@ using namespace Gdiplus;
 #include <natupnp.h>
 #include <objbase.h>
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "avrt.lib")
 
 static std::deque<std::string> g_log_queue;
 static std::mutex              g_log_mutex;
@@ -194,6 +198,7 @@ static void CryptInputRecv(std::vector<uint8_t>& buf) {
 struct HostConfig {
     int         video_port = 55000;
     int         input_port = 55001;
+    int         audio_port = 55002;
     std::string passphrase;
 
     bool        wan_mode = false;
@@ -276,6 +281,13 @@ static bool LoadSettings(HostConfig& cfg, std::string& err)
             }
             got_iport = true;
         }
+        else if (key == "audio_port") {
+            try { cfg.audio_port = std::stoi(val); }
+            catch (...) { err = "settings.dat: audio_port is not a valid number: \"" + val + "\""; return false; }
+            if (cfg.audio_port < 1024 || cfg.audio_port > 65535) {
+                err = "settings.dat: audio_port must be between 1024 and 65535"; return false;
+            }
+        }
         else if (key == "passphrase") {
             cfg.passphrase = val;
 
@@ -319,6 +331,7 @@ static const uint8_t PKT_HANDSHAKE_DENY = 0x03;
 static const uint8_t PKT_VIDEO_FRAME = 0x04;
 static const uint8_t PKT_HEARTBEAT = 0x05;
 static const uint8_t PKT_HEARTBEAT_ACK = 0x06;
+static const uint8_t PKT_AUDIO_FRAME = 0x12;
 static const uint8_t PKT_MOUSE_EVENT = 0x10;
 static const uint8_t PKT_KEY_EVENT = 0x11;
 static const uint8_t PKT_DISCONNECT = 0xFF;
@@ -417,6 +430,142 @@ static std::string g_ctrl_name;
 static HWND        g_status_hwnd = NULL;
 static bool        g_tray_added = false;
 static NOTIFYICONDATA g_nid;
+
+static void AudioServeClient(SOCKET csock)
+{
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IMMDeviceEnumerator* pEnum = nullptr;
+    IMMDevice* pDevice = nullptr;
+    IAudioClient* pClient = nullptr;
+    IAudioCaptureClient* pCapture = nullptr;
+    WAVEFORMATEX* pwfx = nullptr;
+
+    auto cleanup = [&]() {
+        if (pwfx) { CoTaskMemFree(pwfx); pwfx = nullptr; }
+        if (pCapture) { pCapture->Release(); pCapture = nullptr; }
+        if (pClient) { pClient->Release();  pClient = nullptr; }
+        if (pDevice) { pDevice->Release();  pDevice = nullptr; }
+        if (pEnum) { pEnum->Release();    pEnum = nullptr; }
+        CoUninitialize();
+        };
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
+    if (FAILED(hr)) { Log("AUDIO: no enumerator\n"); cleanup(); return; }
+
+    hr = pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+    if (FAILED(hr)) { Log("AUDIO: no endpoint\n"); cleanup(); return; }
+
+    hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pClient);
+    if (FAILED(hr)) { Log("AUDIO: Activate failed\n"); cleanup(); return; }
+
+    hr = pClient->GetMixFormat(&pwfx);
+    if (FAILED(hr) || !pwfx) { Log("AUDIO: GetMixFormat failed\n"); cleanup(); return; }
+
+    UINT32 nativeCh = pwfx->nChannels;
+    UINT32 nativeSR = pwfx->nSamplesPerSec;
+    UINT32 nativeBPS = pwfx->wBitsPerSample;
+    bool   isFloat = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+    if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        auto* ex = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx);
+        static const GUID kFloat = { 0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71} };
+        isFloat = (ex->SubFormat == kFloat);
+    }
+
+    hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, pwfx, nullptr);
+    CoTaskMemFree(pwfx); pwfx = nullptr;
+    if (FAILED(hr)) { Log("AUDIO: Initialize failed hr=" + std::to_string(hr) + "\n"); cleanup(); return; }
+
+    hr = pClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCapture);
+    if (FAILED(hr)) { Log("AUDIO: GetService failed\n"); cleanup(); return; }
+
+    pClient->Start();
+    Log("AUDIO: streaming\n");
+
+    bool send_ok = true;
+    while (g_running && g_session_active && send_ok) {
+        Sleep(10);
+        UINT32 pktsz = 0;
+        if (FAILED(pCapture->GetNextPacketSize(&pktsz))) break;
+        while (pktsz > 0 && send_ok) {
+            BYTE* pData = nullptr;
+            UINT32 nFrames = 0;
+            DWORD  flags = 0;
+            if (FAILED(pCapture->GetBuffer(&pData, &nFrames, &flags, nullptr, nullptr))) break;
+
+            std::vector<int16_t> pcm16(nFrames * 2, 0);
+            if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && pData) {
+                for (UINT32 f = 0; f < nFrames; f++) {
+                    for (int ch = 0; ch < 2; ch++) {
+                        UINT32 srcCh = (ch < (int)nativeCh) ? ch : nativeCh - 1;
+                        float s = 0.f;
+                        if (isFloat && nativeBPS == 32) {
+                            s = reinterpret_cast<const float*>(pData)[f * nativeCh + srcCh];
+                        }
+                        else if (!isFloat && nativeBPS == 16) {
+                            s = reinterpret_cast<const int16_t*>(pData)[f * nativeCh + srcCh] / 32768.f;
+                        }
+                        else if (!isFloat && nativeBPS == 24) {
+                            const uint8_t* bp = pData + (f * nativeCh + srcCh) * 3;
+                            int32_t v = bp[0] | (bp[1] << 8) | (bp[2] << 16);
+                            if (v & 0x800000) v |= 0xFF000000;
+                            s = v / 8388608.f;
+                        }
+                        else if (!isFloat && nativeBPS == 32) {
+                            s = reinterpret_cast<const int32_t*>(pData)[f * nativeCh + srcCh] / 2147483648.f;
+                        }
+                        s = s < -1.f ? -1.f : s > 1.f ? 1.f : s;
+                        pcm16[f * 2 + ch] = (int16_t)(s * 32767.f);
+                    }
+                }
+            }
+            pCapture->ReleaseBuffer(nFrames);
+
+            UINT32 pcmBytes = nFrames * 4;
+            std::vector<uint8_t> pkt(4 + pcmBytes, 0);
+            memcpy(pkt.data(), &nativeSR, 4);
+            memcpy(pkt.data() + 4, pcm16.data(), pcmBytes);
+            if (!send_packet(csock, PKT_AUDIO_FRAME, pkt.data(), (uint32_t)pkt.size()))
+                send_ok = false;
+            else if (FAILED(pCapture->GetNextPacketSize(&pktsz)))
+                send_ok = false;
+        }
+    }
+
+    pClient->Stop();
+    Log("AUDIO: client disconnected\n");
+    cleanup();
+}
+
+static void AudioStreamThread(int audio_port)
+{
+    SOCKET lsock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (lsock == INVALID_SOCKET) { Log("AUDIO: socket failed\n"); return; }
+    int opt = 1; setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    sockaddr_in sa{}; sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons((u_short)audio_port);
+    if (bind(lsock, (sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR || listen(lsock, 1) == SOCKET_ERROR) {
+        Log("AUDIO: bind/listen failed\n"); closesocket(lsock); return;
+    }
+    Log("AUDIO: Listening on port " + std::to_string(audio_port) + "\n");
+
+    while (g_running) {
+        fd_set rs; FD_ZERO(&rs); FD_SET(lsock, &rs);
+        timeval tv{ 1, 0 };
+        if (select(0, &rs, NULL, NULL, &tv) <= 0) continue;
+        sockaddr_in ca{}; int cal = sizeof(ca);
+        SOCKET csock = accept(lsock, (sockaddr*)&ca, &cal);
+        if (csock == INVALID_SOCKET) continue;
+        Log("AUDIO: client connected\n");
+        AudioServeClient(csock);
+        closesocket(csock);
+    }
+
+    closesocket(lsock);
+    Log("AUDIO: thread exit\n");
+}
 
 static void VideoStreamThread() {
     using namespace std::chrono;
@@ -946,6 +1095,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     Log("HOST: Config OK — video=" + std::to_string(cfg.video_port)
         + " input=" + std::to_string(cfg.input_port)
+        + " audio=" + std::to_string(cfg.audio_port)
         + (cfg.wan_mode ? " mode=WAN" : " mode=LAN")
         + (cfg.startup ? " startup=yes" : " startup=no")
         + (cfg.passphrase.empty() ? " enc=off" : " enc=AES-128-CTR") + "\n");
@@ -1015,6 +1165,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     }
 
     g_running = true;
+    std::thread t_audio(AudioStreamThread, cfg.audio_port);
+
     while (g_running) {
         if (!AcceptSession(vid_listen, inp_listen)) continue;
 
@@ -1038,6 +1190,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     if (cfg.wan_mode) UPnPClosePorts(cfg.video_port, cfg.input_port);
     CoUninitialize();
 
+    if (t_audio.joinable()) t_audio.join();
     closesocket(vid_listen);
     closesocket(inp_listen);
     GdiplusShutdown(g_gdiplus_token);
