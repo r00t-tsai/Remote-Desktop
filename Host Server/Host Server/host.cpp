@@ -337,7 +337,76 @@ static const uint8_t PKT_KEY_EVENT = 0x11;
 static const uint8_t PKT_DISCONNECT = 0xFF;
 
 static const int   FPS_TARGET = 30;
-static const ULONG JPEG_QUAL = 50;
+
+struct BandwidthController {
+    static constexpr ULONG QUALITY_LADDER[4] = { 15, 30, 50, 75 };
+    static constexpr int   LADDER_LEN = 4;
+    static constexpr int   DEFAULT_IDX = 2; 
+    static constexpr double FRAME_BUDGET_MS = 1000.0 / FPS_TARGET;
+    static constexpr int STEP_UP_FRAMES = 10;
+    static constexpr int COOLDOWN_FRAMES = 5;
+    static constexpr double EMA_ALPHA = 0.25;
+
+    int    quality_idx = DEFAULT_IDX;
+    int    fast_streak = 0;     
+    int    cooldown_left = 0;      
+    double ema_send_ms = FRAME_BUDGET_MS * 0.5;
+    long long total_bytes_sent = 0;
+    int    frame_count = 0;
+
+    void reset() {
+        quality_idx = DEFAULT_IDX;
+        fast_streak = 0;
+        cooldown_left = 0;
+        ema_send_ms = FRAME_BUDGET_MS * 0.5;
+        total_bytes_sent = 0;
+        frame_count = 0;
+    }
+
+    ULONG current_quality() const {
+        return QUALITY_LADDER[quality_idx];
+    }
+
+    ULONG update(double frame_ms, size_t bytes_sent) {
+        ema_send_ms = EMA_ALPHA * frame_ms + (1.0 - EMA_ALPHA) * ema_send_ms;
+        total_bytes_sent += (long long)bytes_sent;
+        frame_count++;
+
+        if (cooldown_left > 0) cooldown_left--;
+
+        bool over_budget = (ema_send_ms > FRAME_BUDGET_MS * 0.90);
+        bool well_under = (ema_send_ms < FRAME_BUDGET_MS * 0.60);
+
+        if (over_budget && cooldown_left == 0 && quality_idx > 0) {
+            quality_idx--;
+            cooldown_left = COOLDOWN_FRAMES;
+            fast_streak = 0;
+        }
+        else if (well_under) {
+            fast_streak++;
+            if (fast_streak >= STEP_UP_FRAMES && quality_idx < LADDER_LEN - 1) {
+                quality_idx++;
+                fast_streak = 0;
+                cooldown_left = COOLDOWN_FRAMES;
+            }
+        }
+        else {
+            fast_streak = 0;
+        }
+
+        return current_quality();
+    }
+
+    std::string stats_string() const {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "BWCtrl: q=%lu ema=%.1fms streak=%d cool=%d frames=%d",
+            current_quality(), ema_send_ms, fast_streak, cooldown_left, frame_count);
+        return std::string(buf);
+    }
+};
+
+static BandwidthController g_bw_ctrl;
 
 static bool send_all(SOCKET s, const void* buf, int len) {
     const char* p = (const char*)buf;
@@ -410,11 +479,10 @@ static HDESK SwitchToInputDesktop()
 
     SetThreadDesktop(hInputDesk);
     CloseDesktop(hInputDesk);
-    return hCurDesk;  
+    return hCurDesk; 
 }
 
-static std::vector<uint8_t> CaptureScreenJpeg() {
-
+static std::vector<uint8_t> CaptureScreenJpeg(ULONG jpeg_quality = 50) {
     HDESK hPrevDesk = SwitchToInputDesktop();
 
     HDC hdcScr = GetDC(NULL);
@@ -426,7 +494,7 @@ static std::vector<uint8_t> CaptureScreenJpeg() {
     HDC     hdcMem = CreateCompatibleDC(hdcScr);
     HBITMAP hbmp = CreateCompatibleBitmap(hdcScr, sw, sh);
     HGDIOBJ hOld = SelectObject(hdcMem, hbmp);
-    BitBlt(hdcMem, 0, 0, sw, sh, hdcScr, 0, 0, SRCCOPY);
+    BitBlt(hdcMem, 0, 0, sw, sh, hdcScr, 0, 0, SRCCOPY | CAPTUREBLT);
 
     HFONT hf = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -447,7 +515,7 @@ static std::vector<uint8_t> CaptureScreenJpeg() {
     EncoderParameters ep; memset(&ep, 0, sizeof(ep));
     ep.Count = 1; ep.Parameter[0].Guid = EncoderQuality;
     ep.Parameter[0].Type = EncoderParameterValueTypeLong;
-    ep.Parameter[0].NumberOfValues = 1; ULONG q = JPEG_QUAL;
+    ep.Parameter[0].NumberOfValues = 1; ULONG q = jpeg_quality;
     ep.Parameter[0].Value = &q;
 
     IStream* pStream = NULL; CreateStreamOnHGlobal(NULL, TRUE, &pStream);
@@ -472,6 +540,13 @@ static NOTIFYICONDATA g_nid;
 
 static void AudioServeClient(SOCKET csock)
 {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    int sndbuf = 256 * 1024;
+    setsockopt(csock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+    BOOL nd = 1;
+    setsockopt(csock, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     IMMDeviceEnumerator* pEnum = nullptr;
@@ -523,6 +598,10 @@ static void AudioServeClient(SOCKET csock)
     pClient->Start();
     Log("AUDIO: streaming\n");
 
+    static constexpr size_t BATCH_SAMPLES = 4410;
+    std::vector<int16_t> batch;
+    batch.reserve(BATCH_SAMPLES * 2);
+
     bool send_ok = true;
     while (g_running && g_session_active && send_ok) {
         Sleep(10);
@@ -534,41 +613,44 @@ static void AudioServeClient(SOCKET csock)
             DWORD  flags = 0;
             if (FAILED(pCapture->GetBuffer(&pData, &nFrames, &flags, nullptr, nullptr))) break;
 
-            std::vector<int16_t> pcm16(nFrames * 2, 0);
             if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && pData) {
                 for (UINT32 f = 0; f < nFrames; f++) {
                     for (int ch = 0; ch < 2; ch++) {
                         UINT32 srcCh = (ch < (int)nativeCh) ? ch : nativeCh - 1;
                         float s = 0.f;
-                        if (isFloat && nativeBPS == 32) {
+                        if (isFloat && nativeBPS == 32)
                             s = reinterpret_cast<const float*>(pData)[f * nativeCh + srcCh];
-                        }
-                        else if (!isFloat && nativeBPS == 16) {
+                        else if (!isFloat && nativeBPS == 16)
                             s = reinterpret_cast<const int16_t*>(pData)[f * nativeCh + srcCh] / 32768.f;
-                        }
                         else if (!isFloat && nativeBPS == 24) {
                             const uint8_t* bp = pData + (f * nativeCh + srcCh) * 3;
                             int32_t v = bp[0] | (bp[1] << 8) | (bp[2] << 16);
                             if (v & 0x800000) v |= 0xFF000000;
                             s = v / 8388608.f;
                         }
-                        else if (!isFloat && nativeBPS == 32) {
+                        else if (!isFloat && nativeBPS == 32)
                             s = reinterpret_cast<const int32_t*>(pData)[f * nativeCh + srcCh] / 2147483648.f;
-                        }
                         s = s < -1.f ? -1.f : s > 1.f ? 1.f : s;
-                        pcm16[f * 2 + ch] = (int16_t)(s * 32767.f);
+                        batch.push_back((int16_t)(s * 32767.f));
                     }
                 }
             }
+            else {
+                for (UINT32 f = 0; f < nFrames * 2; f++) batch.push_back(0);
+            }
             pCapture->ReleaseBuffer(nFrames);
 
-            UINT32 pcmBytes = nFrames * 4;
-            std::vector<uint8_t> pkt(4 + pcmBytes, 0);
-            memcpy(pkt.data(), &nativeSR, 4);
-            memcpy(pkt.data() + 4, pcm16.data(), pcmBytes);
-            if (!send_packet(csock, PKT_AUDIO_FRAME, pkt.data(), (uint32_t)pkt.size()))
-                send_ok = false;
-            else if (FAILED(pCapture->GetNextPacketSize(&pktsz)))
+            if (batch.size() >= BATCH_SAMPLES * 2) {
+                size_t pcmBytes = batch.size() * sizeof(int16_t);
+                std::vector<uint8_t> pkt(4 + pcmBytes, 0);
+                memcpy(pkt.data(), &nativeSR, 4);
+                memcpy(pkt.data() + 4, batch.data(), pcmBytes);
+                batch.clear();
+                if (!send_packet(csock, PKT_AUDIO_FRAME, pkt.data(), (uint32_t)pkt.size()))
+                    send_ok = false;
+            }
+
+            if (send_ok && FAILED(pCapture->GetNextPacketSize(&pktsz)))
                 send_ok = false;
         }
     }
@@ -609,20 +691,45 @@ static void AudioStreamThread(int audio_port)
 static void VideoStreamThread() {
     using namespace std::chrono;
     const milliseconds frame_ms(1000 / FPS_TARGET);
-    Log("VIDEO: Streaming started\n");
+    Log("VIDEO: Streaming started (adaptive quality, target=" +
+        std::to_string(FPS_TARGET) + " FPS)\n");
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    HDC hdcScr = GetDC(NULL);
+    int sw = GetDeviceCaps(hdcScr, DESKTOPHORZRES);
+    int sh = GetDeviceCaps(hdcScr, DESKTOPVERTRES);
+    if (sw <= 0) sw = GetSystemMetrics(SM_CXSCREEN);
+    if (sh <= 0) sh = GetSystemMetrics(SM_CYSCREEN);
+    ReleaseDC(NULL, hdcScr);
+
+    BOOL nd = 1;
+    setsockopt(g_video_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(g_video_sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+    g_bw_ctrl.reset();
+
+    ULONG next_quality = g_bw_ctrl.current_quality();
+    int  log_frame_count = 0;
+    auto log_tick = steady_clock::now();
 
     while (g_running && g_session_active) {
         auto t0 = steady_clock::now();
 
-        std::vector<uint8_t> jpeg = CaptureScreenJpeg();
+#if defined(SO_SNDBUF)
+        {
+            int cur_sndbuf = 0, opt_len = sizeof(cur_sndbuf);
+            getsockopt(g_video_sock, SOL_SOCKET, SO_SNDBUF,
+                (char*)&cur_sndbuf, &opt_len);
+
+            (void)cur_sndbuf;
+        }
+#endif
+
+        std::vector<uint8_t> jpeg = CaptureScreenJpeg(next_quality);
         if (!jpeg.empty()) {
-            POINT cur = { 0, 0 }; GetCursorPos(&cur);
-            HDC tmp = GetDC(NULL);
-            int sw = GetDeviceCaps(tmp, DESKTOPHORZRES);
-            int sh = GetDeviceCaps(tmp, DESKTOPVERTRES);
-            ReleaseDC(NULL, tmp);
-            if (sw <= 0) sw = GetSystemMetrics(SM_CXSCREEN);
-            if (sh <= 0) sh = GetSystemMetrics(SM_CYSCREEN);
+            POINT cur = { 0, 0 };
+            GetCursorPos(&cur);
 
             int nx = sw ? (int)(((double)cur.x / sw) * 65535) : 0;
             int ny = sh ? (int)(((double)cur.y / sh) * 65535) : 0;
@@ -643,10 +750,32 @@ static void VideoStreamThread() {
                 Log("VIDEO: Send failed\n");
                 break;
             }
+
+            auto elapsed_us = duration_cast<microseconds>(
+                steady_clock::now() - t0).count();
+            double elapsed_ms = elapsed_us / 1000.0;
+            next_quality = g_bw_ctrl.update(elapsed_ms, payload.size());
+
+            log_frame_count++;
+            if (log_frame_count >= 150) {
+                log_frame_count = 0;
+                auto now = steady_clock::now();
+                double wall_s = duration_cast<milliseconds>(
+                    now - log_tick).count() / 1000.0;
+                log_tick = now;
+                double actual_fps = 150.0 / (wall_s > 0.001 ? wall_s : 1.0);
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                    "VIDEO: %.1f FPS | q=%lu | ema=%.1fms | bytes/frame=%zu\n",
+                    actual_fps, g_bw_ctrl.current_quality(),
+                    g_bw_ctrl.ema_send_ms, payload.size());
+                Log(std::string(buf));
+            }
         }
 
-        auto elapsed = duration_cast<milliseconds>(steady_clock::now() - t0);
-        if (elapsed < frame_ms) std::this_thread::sleep_for(frame_ms - elapsed);
+        auto used = duration_cast<milliseconds>(steady_clock::now() - t0);
+        if (used < frame_ms)
+            std::this_thread::sleep_for(frame_ms - used);
     }
 
     Log("VIDEO: Streaming ended\n");
@@ -681,7 +810,11 @@ static void InputThread() {
     ReleaseDC(NULL, tmp);
     if (phys_w <= 0) phys_w = GetSystemMetrics(SM_CXSCREEN);
     if (phys_h <= 0) phys_h = GetSystemMetrics(SM_CYSCREEN);
-    double abs_x = phys_w / 2.0, abs_y = phys_h / 2.0;
+
+    POINT curPt = {};
+    GetCursorPos(&curPt);
+    double abs_x = (double)curPt.x;
+    double abs_y = (double)curPt.y;
 
     while (g_running && g_session_active) {
         Packet pkt;
@@ -708,6 +841,13 @@ static void InputThread() {
                 double cy = max(0.0, min((double)(phys_h - 1), abs_y));
                 inp.mi.dx = (LONG)((cx / phys_w) * 65535.0);
                 inp.mi.dy = (LONG)((cy / phys_h) * 65535.0);
+                inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            }
+            else if (evt == "warp") {
+                abs_x = max(0.0, min((double)(phys_w - 1), (double)rx));
+                abs_y = max(0.0, min((double)(phys_h - 1), (double)ry));
+                inp.mi.dx = (LONG)((abs_x / phys_w) * 65535.0);
+                inp.mi.dy = (LONG)((abs_y / phys_h) * 65535.0);
                 inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
             }
             else if (evt == "down") {
@@ -740,7 +880,7 @@ static void InputThread() {
 
             if (vk == VK_DELETE && pressed && ctrl_down && alt_down) {
                 if (pfnSendSAS) {
-                    pfnSendSAS(FALSE); 
+                    pfnSendSAS(FALSE);
                     Log("INPUT: SendSAS triggered\n");
                 }
                 else {
@@ -757,7 +897,7 @@ static void InputThread() {
                     SendInput(3, sas, sizeof(INPUT));
                     Log("INPUT: Ctrl+Alt+Del fallback injected\n");
                 }
-                continue;
+                continue;  
             }
 
             WORD sc = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -1259,6 +1399,7 @@ static bool AcceptSession(SOCKET vid_listen, SOCKET inp_listen) {
 
     g_aes_vid_send_ctr = 0;
     g_aes_inp_recv_ctr = 0;
+    g_bw_ctrl.reset();
 
     send_packet_empty(vs, PKT_HANDSHAKE_ACK);
     g_video_sock = vs;
@@ -1454,6 +1595,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     }
 
     LogInit();
+
     CheckAndWarnSASRegistry();
 
     HostConfig cfg;
