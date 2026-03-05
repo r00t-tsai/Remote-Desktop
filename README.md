@@ -2,12 +2,12 @@
 A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen and control the mouse and keyboard of another machine over a local network.
 
 ## Components
-### Client
+### Host
 * Listens for incoming connections on TCP ports 55000 (video) and 55001 (input).
 * Streams the desktop using GDI+ JPEG compression.
 * Injects received mouse and keyboard commands into the system.
 
-### Dashboard
+### Dashboard Client
 * GUI to enter the target Host IP and your connection name.
 * Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the client.
 
