@@ -16,7 +16,7 @@ This is one of my side projects back then that I forgot to upload when I was sti
 * Exports Host configuration settings.
 * Takes the audio data streamed from the Host and plays it through the speakers using Windows multimedia APIs.
 
-> ## TO-DO LIST for v1.1.2
+> ## TO-DO LIST for v1.1.4
 > 
 > * Implement support for UAC Popups and Windows Security Screen
 
