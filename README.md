@@ -33,7 +33,8 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 5.  Export the settings.dat and place it in the same directory as the host program in the host machine.
 6.  Start the host program and connect the Dashboard to it.
 
+
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/826a084e-be17-4036-846a-01234cc155e5" width="800" controls></video>
+  <video src="https://github.com/user-attachments/assets/2a1bee6e-d966-4a84-b1d4-9d6f2e521f3b" width="800" controls></video>
   <p><i>Demonstration</i></p>
 </div>
