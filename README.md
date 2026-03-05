@@ -21,13 +21,13 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 
 ## Usage Instructions:
 1.  Open the Dashboard Client app
-2.  Configure the video/input ports
+2.  Configure the video/audio/input ports
 3.  Check WAN Discovery if the Host machine is on a different network, otherwise leave it to LAN.
-4.  OPTIONAL Encryption Passphrase to encrypt the data sent through the network.
+4.  OPTIONAL: Encryption Passphrase to encrypt the data sent through the network.
 5.  Export the settings.dat and place it in the same directory as the host program in the host machine.
 6.  Start the host program and connect the Dashboard to it.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/826a084e-be17-4036-846a-01234cc155e5" width="800" controls></video>
-  <p><i>Demo: Controlling a Remote Desktop Session</i></p>
+  <p><i>Demonstration</i></p>
 </div>
