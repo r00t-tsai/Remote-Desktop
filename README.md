@@ -10,7 +10,7 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 
 ### Dashboard Client
 * GUI to enter the target Host IP and your connection name.
-* Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the client.
+* Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the host program.
 * Exports Host configuration settings.
 * Takes the audio data streamed from the Host and plays it through the speakers using Windows multimedia APIs.
 
