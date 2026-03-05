@@ -165,6 +165,86 @@ static void CryptInputSend(std::vector<uint8_t>& buf) {
     AES128::CTR_XOR(g_aes_ctx, ctr, buf.data(), buf.size());
 }
 
+
+struct RecvBandwidthMonitor {
+    static constexpr int    FPS_TARGET = 30;
+    static constexpr int    FPS_MIN = 28;  
+    static constexpr double EMA_ALPHA = 0.20;
+    static constexpr int RING_SIZE = FPS_TARGET * 2 + 8;
+
+    double  frame_times[RING_SIZE] = {}; 
+    int     ring_head = 0;
+    int     ring_count = 0;
+
+    double  ema_fps = 0.0;
+    double  last_fps_sample = 0.0; 
+    int     frame_tick = 0;   
+
+    long long bytes_this_sec = 0;
+    long long bytes_last_sec = 0;
+    double    bytes_tick = 0.0;
+
+    std::atomic<bool> congested{ false };
+    bool on_frame_received(size_t byte_len, bool newer_queued)
+    {
+        double now_s = (double)GetTickCount64() / 1000.0;
+
+        frame_tick++;
+        bool warmed_up = (frame_tick >= 60);
+
+        frame_times[ring_head] = now_s;
+        ring_head = (ring_head + 1) % RING_SIZE;
+        if (ring_count < RING_SIZE) ring_count++;
+
+        int   fps_raw = 0;
+        double window = 1.0;
+        for (int i = 0; i < ring_count; i++) {
+            int idx = (ring_head - 1 - i + RING_SIZE) % RING_SIZE;
+            if ((now_s - frame_times[idx]) <= window) fps_raw++;
+            else break;
+        }
+
+        if ((now_s - last_fps_sample) >= 0.5) {
+            double instantaneous = (double)fps_raw;
+            if (ema_fps < 0.1) ema_fps = instantaneous; 
+            else ema_fps = EMA_ALPHA * instantaneous + (1.0 - EMA_ALPHA) * ema_fps;
+            last_fps_sample = now_s;
+        }
+
+        bytes_this_sec += (long long)byte_len;
+        if ((now_s - bytes_tick) >= 1.0) {
+            bytes_last_sec = bytes_this_sec;
+            bytes_this_sec = 0;
+            bytes_tick = now_s;
+        }
+
+        if (warmed_up && ema_fps > 0.5) {
+            congested = (ema_fps < FPS_MIN);
+        }
+        else {
+            congested = false;  
+        }
+
+        if (warmed_up && newer_queued && congested) {
+            return false; 
+        }
+        return true;      
+    }
+
+    double measured_fps() const { return ema_fps; }
+    long long throughput_bps() const { return bytes_last_sec * 8; }
+    bool is_congested() const { return congested.load(); }
+
+    void reset() {
+        ring_head = ring_count = frame_tick = 0;
+        ema_fps = last_fps_sample = bytes_tick = 0.0;
+        bytes_this_sec = bytes_last_sec = 0;
+        congested = false;
+    }
+};
+
+static RecvBandwidthMonitor g_recv_bw;
+
 static constexpr int ID_BTN_CONNECT = 101;
 static constexpr int ID_BTN_DISCONNECT = 102;
 static constexpr int ID_BTN_DEBUG = 103;
@@ -430,6 +510,7 @@ public:
 
     std::function<void(PendingFrame)> frame_callback;
     std::function<void(std::string)>  status_callback;
+    std::function<bool()>             pending_check_callback; 
 
     std::thread recv_thread;
 
@@ -503,6 +584,11 @@ public:
 
     void recv_loop()
     {
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, sizeof(rcvbuf));
+
+        g_recv_bw.reset();
+
         while (running) {
             uint8_t ptype; std::vector<uint8_t> pdata;
             if (!recv_packet(sock, ptype, pdata)) break;
@@ -517,7 +603,16 @@ public:
                 pf.jpeg.assign(pdata.begin() + 8, pdata.end());
                 pf.cx_n = cx_n;
                 pf.cy_n = cy_n;
-                if (frame_callback) frame_callback(std::move(pf));
+
+                bool newer_queued = pending_check_callback
+                    ? pending_check_callback() : false;
+
+                bool should_render = g_recv_bw.on_frame_received(
+                    pdata.size(), newer_queued);
+
+                if (should_render && frame_callback)
+                    frame_callback(std::move(pf));
+
             }
             else if (ptype == PKT_HEARTBEAT) {
                 send_packet(sock, PKT_HEARTBEAT_ACK);
@@ -544,11 +639,12 @@ public:
 };
 
 static float  g_audio_volume = 1.0f;
-
 static HANDLE g_audio_stop_evt = NULL;
 
 static void AudioPlaybackThread(SOCKET sock)
 {
+    static constexpr int    NUM = 8;
+    static constexpr int    BSIZ = 17640;
 
     WAVEFORMATEX wfx{};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
@@ -559,18 +655,17 @@ static void AudioPlaybackThread(SOCKET sock)
     wfx.nAvgBytesPerSec = 44100 * 4;
 
     HWAVEOUT hwo = NULL;
-
-    bool waveout_open = false;
-
-    static constexpr int NUM = 4;
-    static constexpr int BSIZ = 8820;
+    bool     waveout_open = false;
 
     std::vector<std::vector<int16_t>> rawbufs(NUM, std::vector<int16_t>(BSIZ / 2, 0));
     WAVEHDR hdr[NUM]{};
     int nxt = 0;
 
-    DWORD rto = 200;
+    DWORD rto = 5000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&rto, sizeof(rto));
+
+    int sndbuf = 256 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&sndbuf, sizeof(sndbuf));
 
     for (;;) {
         if (g_audio_stop_evt &&
@@ -579,18 +674,29 @@ static void AudioPlaybackThread(SOCKET sock)
         uint8_t ph[5]; int got = 0;
         while (got < 5) {
             int r = recv(sock, (char*)ph + got, 5 - got, 0);
-            if (r <= 0) goto aud_done;
+            if (r <= 0) {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT) continue;
+                goto aud_done;
+            }
             got += r;
         }
+
         uint8_t  ptype = ph[0];
-        uint32_t plen = 0; memcpy(&plen, ph + 1, 4); plen = ntohl(plen);
+        uint32_t plen = 0;
+        memcpy(&plen, ph + 1, 4);
+        plen = ntohl(plen);
         if (plen > 512 * 1024) break;
 
         std::vector<uint8_t> body(plen);
         got = 0;
         while (got < (int)plen) {
             int r = recv(sock, (char*)body.data() + got, (int)plen - got, 0);
-            if (r <= 0) goto aud_done;
+            if (r <= 0) {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT) continue;
+                goto aud_done;
+            }
             got += r;
         }
 
@@ -604,7 +710,6 @@ static void AudioPlaybackThread(SOCKET sock)
         if (!waveout_open) {
             wfx.nSamplesPerSec = pktSR;
             wfx.nAvgBytesPerSec = pktSR * 4;
-
             if (waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
                 goto aud_done;
             for (int i = 0; i < NUM; i++) {
@@ -617,14 +722,16 @@ static void AudioPlaybackThread(SOCKET sock)
         }
 
         size_t nBytes = plen - 4;
-        size_t nSamples = nBytes / 2;
         const int16_t* src = reinterpret_cast<const int16_t*>(body.data() + 4);
 
         WAVEHDR& wh = hdr[nxt];
-        for (int w = 0; w < 500 && !(wh.dwFlags & WHDR_DONE); w++) Sleep(1);
-        if (!(wh.dwFlags & WHDR_DONE)) continue;
+        for (int w = 0; w < 200 && !(wh.dwFlags & WHDR_DONE); w++) Sleep(1);
+        if (!(wh.dwFlags & WHDR_DONE)) {
+            nxt = (nxt + 1) % NUM;
+            continue;
+        }
 
-        float vol = g_audio_volume;
+        float  vol = g_audio_volume;
         size_t copyBytes = (nBytes < BSIZ) ? nBytes : BSIZ;
         size_t copySamples = copyBytes / 2;
         int16_t* dst = rawbufs[nxt].data();
@@ -640,7 +747,8 @@ static void AudioPlaybackThread(SOCKET sock)
 aud_done:
     if (waveout_open && hwo) {
         waveOutReset(hwo);
-        for (int i = 0; i < NUM; i++) waveOutUnprepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
+        for (int i = 0; i < NUM; i++)
+            waveOutUnprepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
         waveOutClose(hwo);
     }
     shutdown(sock, SD_BOTH);
@@ -708,6 +816,7 @@ public:
     HBITMAP hFrameBmp = NULL;
     int     frameSrcW = 0, frameSrcH = 0;
     double  cursorRatX = 0, cursorRatY = 0;
+    double  vCursorX = 0.5, vCursorY = 0.5;
     bool    firstFrame = true;
 
     HBITMAP hCursorBmp = NULL;
@@ -1630,6 +1739,7 @@ void ControllerApp::on_connect()
 
     g_aes_inp_send_ctr = 0;
     g_aes_vid_recv_ctr = 0;
+    g_recv_bw.reset();
 
     std::wstring wip(ip_buf), wname(name_buf);
     std::string  host(wip.begin(), wip.end());
@@ -1781,6 +1891,9 @@ void ControllerApp::on_connect()
         vc->frame_callback = [this](PendingFrame pf) {
             on_frame(std::move(pf));
             };
+        vc->pending_check_callback = [this]() -> bool {
+            return frame_scheduled.load();
+            };
         vc->status_callback = [this, postTarget](std::string msg) {
             HWND target = hSessionWnd ? hSessionWnd : postTarget;
             PostMessage(target, WM_APP_STATUS, 0,
@@ -1901,8 +2014,10 @@ void ControllerApp::render_frame()
     hFrameBmp = hNew;
     frameSrcW = jw;
     frameSrcH = jh;
-    cursorRatX = pf->cx_n / 65535.0;
-    cursorRatY = pf->cy_n / 65535.0;
+    if (!cursor_locked) {
+        cursorRatX = pf->cx_n / 65535.0;
+        cursorRatY = pf->cy_n / 65535.0;
+    }
 
     if (firstFrame || (jw > 0 && frameSrcW == jw)) {
         if (jw > 0) fit_window_to_frame(jw, jh);
@@ -1958,8 +2073,11 @@ void ControllerApp::on_paint_canvas(HDC hdc)
     blit_bitmap(hdc, hFrameBmp, frameSrcW, frameSrcH, 0, 0, cw, ch);
 
     if (hCursorBmp) {
-        int cx = (int)(cursorRatX * cw);
-        int cy = (int)(cursorRatY * ch);
+        double drawX = cursor_locked ? vCursorX : cursorRatX;
+        double drawY = cursor_locked ? vCursorY : cursorRatY;
+
+        int cx = (int)(drawX * cw);
+        int cy = (int)(drawY * ch);
 
         BLENDFUNCTION bf{};
         bf.BlendOp = AC_SRC_OVER;
@@ -1987,10 +2105,26 @@ void ControllerApp::lock_cursor()
     warp_pending.fetch_add(1);
     SetCursorPos(pin_cx, pin_cy);
 
+    double refW = frameSrcW > 0 ? (double)frameSrcW : 1920.0;
+    double refH = frameSrcH > 0 ? (double)frameSrcH : 1080.0;
+    double abs_x = cursorRatX * refW;
+    double abs_y = cursorRatY * refH;
+    abs_x = std::max(0.0, std::min(refW - 1.0, abs_x));
+    abs_y = std::max(0.0, std::min(refH - 1.0, abs_y));
+    vCursorX = abs_x / refW;
+    vCursorY = abs_y / refH;
+
+    if (input_conn && input_conn->running) {
+        int16_t wx = static_cast<int16_t>(std::max(0.0, std::min(refW - 1.0, abs_x)));
+        int16_t wy = static_cast<int16_t>(std::max(0.0, std::min(refH - 1.0, abs_y)));
+        input_conn->send_mouse(wx, wy, "warp");
+    }
+
     ShowCursor(FALSE);
 
     start_listeners();
 }
+
 static std::atomic<bool> g_hook_ctrl{ false };
 static std::atomic<bool> g_hook_shift{ false };
 static std::atomic<bool> g_hook_alt{ false };
@@ -1998,12 +2132,13 @@ static std::atomic<bool> g_hook_alt{ false };
 void ControllerApp::unlock_cursor()
 {
     if (!cursor_locked) return;
+    cursorRatX = vCursorX;
+    cursorRatY = vCursorY;
     cursor_locked = false;
     SetWindowTextW(hLockLabel,
         L"Click inside stream to lock cursor  |  ESC to unlock");
     ShowCursor(TRUE);
     stop_listeners();
-
     g_hook_ctrl = false;
     g_hook_shift = false;
     g_hook_alt = false;
@@ -2035,27 +2170,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp)
 
         if (pressed || released) {
 
-            if (vk == VK_ESCAPE && pressed) {
-                HWND hw = g_app->hSessionWnd ? g_app->hSessionWnd : g_app->hwnd;
-                PostMessageW(hw, WM_KEYDOWN, VK_ESCAPE, 0);
-                return 1; 
-            }
-
-            if (vk == VK_F12 && pressed) {
-                HWND hw2 = g_app->hSessionWnd ? g_app->hSessionWnd : g_app->hwnd;
-                PostMessageW(hw2, WM_COMMAND,
-                    MAKEWPARAM(ID_BTN_DEBUG, BN_CLICKED), 0);
-                return 1;
-            }
-
-            if (vk == VK_TAB && g_hook_alt) {
-                if (!ui_has_focus()) {
-                    g_app->input_conn->send_key(VK_MENU, pressed);
-                    g_app->input_conn->send_key(VK_TAB, pressed);
-                }
-                return 1; 
-            }
-
             if (vk == VK_ESCAPE && g_hook_ctrl && g_hook_shift) {
                 if (!ui_has_focus()) {
                     g_app->input_conn->send_key(VK_CONTROL, pressed);
@@ -2074,10 +2188,31 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp)
                 return 1;
             }
 
-            if ((vk == VK_LWIN || vk == VK_RWIN)) {
+            if (vk == VK_TAB && g_hook_alt) {
+                if (!ui_has_focus()) {
+                    g_app->input_conn->send_key(VK_MENU, pressed);
+                    g_app->input_conn->send_key(VK_TAB, pressed);
+                }
+                return 1;
+            }
+
+            if (vk == VK_ESCAPE && pressed) {
+                HWND hw = g_app->hSessionWnd ? g_app->hSessionWnd : g_app->hwnd;
+                PostMessageW(hw, WM_KEYDOWN, VK_ESCAPE, 0);
+                return 1;
+            }
+
+            if (vk == VK_F12 && pressed) {
+                HWND hw2 = g_app->hSessionWnd ? g_app->hSessionWnd : g_app->hwnd;
+                PostMessageW(hw2, WM_COMMAND,
+                    MAKEWPARAM(ID_BTN_DEBUG, BN_CLICKED), 0);
+                return 1;
+            }
+
+            if (vk == VK_LWIN || vk == VK_RWIN) {
                 if (!ui_has_focus())
                     g_app->input_conn->send_key(vk, pressed);
-                return 1; 
+                return 1;
             }
 
             if (!ui_has_focus()) {
@@ -2110,7 +2245,6 @@ void ControllerApp::start_listeners()
 
 void ControllerApp::stop_listeners()
 {
-
     if (kb_hook) {
         UnhookWindowsHookEx(kb_hook);
         kb_hook = NULL;
@@ -2120,14 +2254,15 @@ void ControllerApp::stop_listeners()
     warp_pending = 0;
 
     HWND rh = raw_hwnd;
-    raw_hwnd = NULL;
     if (rh) PostMessageW(rh, WM_QUIT, 0, 0);
     if (raw_thread.joinable()) raw_thread.join();
+    raw_hwnd = NULL;
 }
 
 void ControllerApp::raw_input_loop()
 {
-    const wchar_t* CLS = L"RawInputSink_RC";
+    wchar_t CLS[64];
+    swprintf_s(CLS, L"RawInputSink_RC_%u", GetCurrentThreadId());
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -2138,13 +2273,15 @@ void ControllerApp::raw_input_loop()
 
     HWND hw = CreateWindowExW(0, CLS, NULL, 0,
         0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    if (!hw) {
+        UnregisterClassW(CLS, hInstance);
+        return;
+    }
     raw_hwnd = hw;
 
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01;
-
     rid.usUsage = 0x02;
-
     rid.dwFlags = RIDEV_INPUTSINK;
     rid.hwndTarget = hw;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
@@ -2159,6 +2296,7 @@ void ControllerApp::raw_input_loop()
     rid.hwndTarget = NULL;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
     DestroyWindow(hw);
+    raw_hwnd = NULL;
     UnregisterClassW(CLS, hInstance);
 }
 void ControllerApp::handle_raw_input(LPARAM lp)
@@ -2183,7 +2321,6 @@ void ControllerApp::handle_raw_input(LPARAM lp)
     int dy = rm.lLastY;
     if (dx != 0 || dy != 0) {
         if (warp_pending.load() > 0) {
-
             warp_pending.fetch_sub(1);
         }
         else {
@@ -2198,6 +2335,18 @@ void ControllerApp::handle_raw_input(LPARAM lp)
             if (ix != 0 || iy != 0) {
                 input_conn->send_mouse(ix, iy, "rel ");
                 dbg_pkts_sent++;
+
+                double refW = frameSrcW > 0 ? (double)frameSrcW : 1920.0;
+                double refH = frameSrcH > 0 ? (double)frameSrcH : 1080.0;
+
+                double abs_x = vCursorX * refW;
+                double abs_y = vCursorY * refH;
+                abs_x += ix;
+                abs_y += iy;
+                abs_x = std::max(0.0, std::min(refW - 1.0, abs_x));
+                abs_y = std::max(0.0, std::min(refH - 1.0, abs_y));
+                vCursorX = abs_x / refW;
+                vCursorY = abs_y / refH;
             }
 
             if (hCanvas) {
@@ -2207,7 +2356,6 @@ void ControllerApp::handle_raw_input(LPARAM lp)
                 pin_cy = (cr.top + cr.bottom) / 2;
             }
             warp_pending.fetch_add(1);
-
             SetCursorPos(pin_cx, pin_cy);
         }
     }
@@ -2223,10 +2371,8 @@ void ControllerApp::handle_raw_input(LPARAM lp)
     if (bf & RI_MOUSE_WHEEL) {
         SHORT raw = static_cast<SHORT>(rm.usButtonData);
         int   ticks = raw / WHEEL_DELTA;
-
         char  sbuf[8];
         snprintf(sbuf, sizeof(sbuf), "%+d", ticks);
-
         input_conn->send_mouse(0, 0, "scro", sbuf);
     }
 }
@@ -2239,15 +2385,16 @@ void ControllerApp::fwd_key(WPARAM vk, bool pressed)
     input_conn->send_key(static_cast<uint32_t>(vk), pressed);
 }
 
-static HWND hDebugLabels[14] = {};
-static HWND hDebugVals[14] = {};
-static constexpr int DBG_ROWS = 13;
+static HWND hDebugLabels[16] = {};
+static HWND hDebugVals[16] = {};
+static constexpr int DBG_ROWS = 15;
 
 static const wchar_t* DBG_NAMES[] = {
     L"Cursor locked", L"Warp count", L"Raw events total", L"Mouse pkts sent",
     L"Last dx/dy",    L"Stream FPS",   L"Frames rendered",  L"Pin centre (px)",
     L"Lock rect",     L"Video conn",   L"Input conn",       L"Raw HWND",
-    L"Raw thread alive"
+    L"Raw thread alive",
+    L"Recv FPS (EMA)", L"Throughput"
 };
 
 static LRESULT CALLBACK DebugWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -2307,7 +2454,7 @@ void ControllerApp::toggle_debug()
 
         hDebugWin = CreateWindowExW(WS_EX_TOPMOST, L"RDDebugCls", L"Debug",
             WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            50, 50, 410, 30 + DBG_ROWS * 18 + 40, NULL, NULL, hInstance, NULL);
+            50, 50, 430, 30 + DBG_ROWS * 18 + 40, NULL, NULL, hInstance, NULL);
 
         HWND hTitle = CreateWindowW(L"STATIC", L"CONTROLLER DEBUG",
             WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
@@ -2361,6 +2508,19 @@ void ControllerApp::update_debug()
     sv(10, (input_conn && input_conn->running) ? L"connected" : L"none");
     sv(11, raw_hwnd ? L"active" : L"None");
     sv(12, b2w(raw_running.load()));
+
+    {
+        std::wostringstream ss;
+        ss << std::fixed << std::setprecision(1) << g_recv_bw.measured_fps()
+            << L" fps" << (g_recv_bw.is_congested() ? L"  [CONGESTED]" : L"");
+        sv(13, ss.str());
+    }
+    {
+        std::wostringstream ss;
+        long long kbps = g_recv_bw.throughput_bps() / 1000;
+        ss << kbps << L" kbps";
+        sv(14, ss.str());
+    }
 
     if (debugVisible)
         SetTimer(hDebugWin, 1, 200, [](HWND, UINT, UINT_PTR, DWORD) {
