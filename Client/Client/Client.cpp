@@ -5,7 +5,6 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #define WIN32_LEAN_AND_MEAN
@@ -14,7 +13,6 @@
 #include <shellapi.h>
 #include <gdiplus.h>
 using namespace Gdiplus;
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,7 +25,6 @@ using namespace Gdiplus;
 #include <string>
 #include <thread>
 #include <vector>
-
 #include <natupnp.h>
 #include <objbase.h>
 #pragma comment(lib, "ole32.lib")
@@ -174,13 +171,13 @@ namespace AES128 {
                 key[b] = SBOX[key[b] ^ (uint8_t)r ^ key[(b + 7) % 16]];
     }
 
-} 
+}
 
 static AES128::AESCtx        g_aes_ctx;
 static bool                  g_aes_enabled = false;
-static std::atomic<uint64_t> g_aes_vid_send_ctr{ 0 };  
+static std::atomic<uint64_t> g_aes_vid_send_ctr{ 0 };
 
-static std::atomic<uint64_t> g_aes_inp_recv_ctr{ 0 };  
+static std::atomic<uint64_t> g_aes_inp_recv_ctr{ 0 };
 
 static void CryptVideoSend(std::vector<uint8_t>& buf) {
     if (!g_aes_enabled || buf.empty()) return;
@@ -197,11 +194,11 @@ static void CryptInputRecv(std::vector<uint8_t>& buf) {
 struct HostConfig {
     int         video_port = 55000;
     int         input_port = 55001;
-    std::string passphrase;        
+    std::string passphrase;
 
-    bool        wan_mode = false; 
+    bool        wan_mode = false;
 
-    bool        startup = false; 
+    bool        startup = false;
 
 };
 
@@ -228,16 +225,7 @@ static bool LoadSettings(HostConfig& cfg, std::string& err)
     std::ifstream f(narrowPath);
     if (!f.is_open()) {
         err =
-            "settings.dat was not found next to this program.\n\n"
-            "Create a file called settings.dat in the same folder with this content:\n\n"
-            "    video_port = 55000\n"
-            "    input_port = 55001\n"
-            "    connection = LAN\n"
-            "    passphrase = YourSharedSecret\n\n"
-            "connection must be LAN or WAN (WAN enables UPnP port forwarding).\n"
-            "startup = true  (optional) registers agent in Windows startup.\n"
-            "The passphrase line is optional. Omit it to disable encryption.\n"
-            "Both sides must use the same ports and passphrase.";
+            "Settings (settings.dat) was not found next to this program.\n";
         return false;
     }
 
@@ -289,7 +277,7 @@ static bool LoadSettings(HostConfig& cfg, std::string& err)
             got_iport = true;
         }
         else if (key == "passphrase") {
-            cfg.passphrase = val;   
+            cfg.passphrase = val;
 
         }
         else if (key == "connection") {
@@ -699,12 +687,11 @@ static bool ShowConsentDialog(const std::string& ctrl_name) {
     std::wstring wn(ctrl_name.begin(), ctrl_name.end());
     std::wstring msg =
         L"A remote controller is requesting access.\n\n"
-        L"Controller: " + wn + L"\n\n"
+        L"Name: " + wn + L"\n\n"
         L"If you allow:\n"
-        L"  - Your screen will be streamed to them\n"
+        L"  - Your screen will be streamed.\n"
         L"  - They can control your mouse and keyboard\n"
         L"  - A red watermark will appear on your screen\n"
-        L"  - You can disconnect at any time via the tray icon\n\n"
         L"Do you want to allow this connection?";
     return MessageBoxW(NULL, msg.c_str(),
         L"Remote Desktop - Access Request",
@@ -747,13 +734,13 @@ static bool UPnPAddMapping(IStaticPortMappingCollection* pColl,
 
     IStaticPortMapping* pMap = nullptr;
     HRESULT hr = pColl->Add(
-        (long)port,   
+        (long)port,
 
         bProto,
-        (long)port,   
+        (long)port,
 
         bLocalIP,
-        VARIANT_TRUE, 
+        VARIANT_TRUE,
 
         bDesc,
         &pMap);
@@ -921,12 +908,11 @@ static bool SetStartupEntry(bool enable)
 
 static void HandleStartupRegistration()
 {
-    if (IsInStartup()) return;   
+    if (IsInStartup()) return;
 
     int answer = MessageBoxW(
         NULL,
-        L"This Remote Desktop Host agent is configured to register itself\n"
-        L"in Windows startup so it launches automatically when you log in.\n\n"
+        L"This client is configured to register in Windows Startup\n"
         L"Do you want to add it to your startup apps?\n\n"
         L"(You can remove it later via Task Manager > Startup Apps)",
         L"Remote Desktop Host - Startup Registration",
@@ -1060,3 +1046,4 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     LogShutdown();
     return 0;
 }
+
