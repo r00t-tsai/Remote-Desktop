@@ -1,7 +1,7 @@
 # Simple C++ Remote Desktop Protocol
 A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen, listen to audio playbacks, and control the mouse and keyboard of another machine over WAN/LAN. 
 
-This is one of my side projects back then that I forgot to upload when I was still in college practicing networking. This is not a production-ready but a proof-of-concept program.
+This is one of my side projects back then that I forgot to upload when I was still in college practicing networking. This is not production-ready but only a proof-of-concept program that 100% works on private communication scenarios.
 
 ## Components
 ### Host
