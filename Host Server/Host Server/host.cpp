@@ -1,0 +1,1048 @@
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "Gdiplus.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <gdiplus.h>
+using namespace Gdiplus;
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <natupnp.h>
+#include <objbase.h>
+#pragma comment(lib, "ole32.lib")
+
+static std::deque<std::string> g_log_queue;
+static std::mutex              g_log_mutex;
+static std::condition_variable g_log_cv;
+static std::atomic<bool>       g_log_running(false);
+static std::thread             g_log_thread;
+
+static void LogWorker()
+{
+    std::ofstream f("remote_host.log", std::ios::app);
+    while (g_log_running.load()) {
+        std::deque<std::string> batch;
+        {
+            std::unique_lock<std::mutex> lk(g_log_mutex);
+            g_log_cv.wait_for(lk, std::chrono::milliseconds(100),
+                [] { return !g_log_queue.empty() || !g_log_running.load(); });
+            batch.swap(g_log_queue);
+        }
+        for (auto& m : batch) if (f.is_open()) f << m;
+        if (f.is_open()) f.flush();
+    }
+    for (auto& m : g_log_queue) if (f.is_open()) f << m;
+}
+static void LogInit()
+{
+    g_log_running = true;
+    g_log_thread = std::thread(LogWorker);
+}
+static void LogShutdown()
+{
+    g_log_running = false;
+    g_log_cv.notify_all();
+    if (g_log_thread.joinable()) g_log_thread.join();
+}
+static void Log(const std::string& msg)
+{
+    std::lock_guard<std::mutex> lk(g_log_mutex);
+    g_log_queue.push_back(msg);
+    g_log_cv.notify_one();
+}
+
+namespace AES128 {
+
+    static const uint8_t SBOX[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+    };
+    static const uint8_t RCON[11] = { 0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+
+    static uint8_t gmul(uint8_t a, uint8_t b) {
+        uint8_t r = 0;
+        for (int i = 0; i < 8; i++) {
+            if (b & 1) r ^= a;
+            bool hi = (a & 0x80) != 0;
+            a <<= 1; if (hi) a ^= 0x1b;
+            b >>= 1;
+        }
+        return r;
+    }
+
+    struct AESCtx { uint8_t rk[176]; };
+
+    static void KeyExpansion(const uint8_t* key, uint8_t* rk) {
+        memcpy(rk, key, 16);
+        for (int i = 4; i < 44; i++) {
+            uint8_t tmp[4]; memcpy(tmp, &rk[(i - 1) * 4], 4);
+            if (i % 4 == 0) {
+                uint8_t t = tmp[0];
+                tmp[0] = SBOX[tmp[1]] ^ RCON[i / 4];
+                tmp[1] = SBOX[tmp[2]];
+                tmp[2] = SBOX[tmp[3]];
+                tmp[3] = SBOX[t];
+            }
+            for (int j = 0; j < 4; j++)
+                rk[i * 4 + j] = rk[(i - 4) * 4 + j] ^ tmp[j];
+        }
+    }
+
+    static void AddRoundKey(uint8_t s[16], const uint8_t* rk) { for (int i = 0; i < 16; i++) s[i] ^= rk[i]; }
+    static void SubBytes(uint8_t s[16]) { for (int i = 0; i < 16; i++) s[i] = SBOX[s[i]]; }
+    static void ShiftRows(uint8_t s[16]) {
+        uint8_t t;
+        t = s[1];  s[1] = s[5];  s[5] = s[9];  s[9] = s[13]; s[13] = t;
+        t = s[2];  s[2] = s[10]; s[10] = t;    t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+    }
+    static void MixColumns(uint8_t s[16]) {
+        for (int c = 0; c < 4; c++) {
+            uint8_t* col = s + c * 4;
+            uint8_t a = col[0], b = col[1], cc = col[2], d = col[3];
+            col[0] = gmul(a, 2) ^ gmul(b, 3) ^ cc ^ d;
+            col[1] = a ^ gmul(b, 2) ^ gmul(cc, 3) ^ d;
+            col[2] = a ^ b ^ gmul(cc, 2) ^ gmul(d, 3);
+            col[3] = gmul(a, 3) ^ b ^ cc ^ gmul(d, 2);
+        }
+    }
+    static void EncryptBlock(const uint8_t* rk, const uint8_t in[16], uint8_t out[16]) {
+        uint8_t s[16]; memcpy(s, in, 16);
+        AddRoundKey(s, rk);
+        for (int r = 1; r < 10; r++) { SubBytes(s); ShiftRows(s); MixColumns(s); AddRoundKey(s, rk + r * 16); }
+        SubBytes(s); ShiftRows(s); AddRoundKey(s, rk + 160);
+        memcpy(out, s, 16);
+    }
+
+    static void CTR_XOR(const AESCtx& ctx, uint64_t counter, uint8_t* buf, size_t len) {
+        uint8_t ctr_block[16] = {};
+        size_t offset = 0;
+        while (offset < len) {
+            uint64_t cbe = 0;
+            for (int i = 0; i < 8; i++) cbe = (cbe << 8) | ((counter >> (56 - i * 8)) & 0xFF);
+            memset(ctr_block, 0, 8);
+            memcpy(ctr_block + 8, &cbe, 8);
+            uint8_t ks[16]; EncryptBlock(ctx.rk, ctr_block, ks);
+            size_t chunk = (len - offset < 16) ? (len - offset) : 16;
+            for (size_t i = 0; i < chunk; i++) buf[offset + i] ^= ks[i];
+            offset += chunk;
+            counter++;
+        }
+    }
+
+    static void DeriveKey(const std::string& passphrase, uint8_t key[16]) {
+        memset(key, 0x5A, 16);
+        for (size_t i = 0; i < passphrase.size(); i++)
+            key[i % 16] ^= (uint8_t)passphrase[i] ^ (uint8_t)(i * 0x9B);
+        for (int r = 0; r < 4096; r++)
+            for (int b = 0; b < 16; b++)
+                key[b] = SBOX[key[b] ^ (uint8_t)r ^ key[(b + 7) % 16]];
+    }
+
+}
+
+static AES128::AESCtx        g_aes_ctx;
+static bool                  g_aes_enabled = false;
+static std::atomic<uint64_t> g_aes_vid_send_ctr{ 0 };
+
+static std::atomic<uint64_t> g_aes_inp_recv_ctr{ 0 };
+
+static void CryptVideoSend(std::vector<uint8_t>& buf) {
+    if (!g_aes_enabled || buf.empty()) return;
+    uint64_t ctr = g_aes_vid_send_ctr.fetch_add(1);
+    AES128::CTR_XOR(g_aes_ctx, ctr, buf.data(), buf.size());
+}
+
+static void CryptInputRecv(std::vector<uint8_t>& buf) {
+    if (!g_aes_enabled || buf.empty()) return;
+    uint64_t ctr = g_aes_inp_recv_ctr.fetch_add(1);
+    AES128::CTR_XOR(g_aes_ctx, ctr, buf.data(), buf.size());
+}
+
+struct HostConfig {
+    int         video_port = 55000;
+    int         input_port = 55001;
+    std::string passphrase;
+
+    bool        wan_mode = false;
+
+    bool        startup = false;
+
+};
+
+static std::string TrimStr(const std::string& s) {
+    const char* ws = " \t\r\n";
+    size_t a = s.find_first_not_of(ws);
+    if (a == std::string::npos) return {};
+    size_t b = s.find_last_not_of(ws);
+    return s.substr(a, b - a + 1);
+}
+
+static bool LoadSettings(HostConfig& cfg, std::string& err)
+{
+
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    wchar_t* slash = wcsrchr(exePath, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exePath, L"settings.dat");
+
+    char narrowPath[MAX_PATH] = {};
+    WideCharToMultiByte(CP_ACP, 0, exePath, -1, narrowPath, MAX_PATH, NULL, NULL);
+
+    std::ifstream f(narrowPath);
+    if (!f.is_open()) {
+        err =
+            "Settings (settings.dat) was not found next to this program.\n";
+        return false;
+    }
+
+    bool got_vport = false, got_iport = false;
+    int  lineno = 0;
+    std::string line;
+
+    while (std::getline(f, line)) {
+        lineno++;
+        std::string t = TrimStr(line);
+        if (t.empty() || t[0] == '#') continue;
+
+        size_t eq = t.find('=');
+        if (eq == std::string::npos) {
+            err = "settings.dat line " + std::to_string(lineno)
+                + ": expected key=value, got: \"" + t + "\"";
+            return false;
+        }
+
+        std::string key = TrimStr(t.substr(0, eq));
+        std::string val = TrimStr(t.substr(eq + 1));
+
+        if (key == "video_port") {
+            try { cfg.video_port = std::stoi(val); }
+            catch (...) {
+                err = "settings.dat line " + std::to_string(lineno)
+                    + ": video_port is not a valid number: \"" + val + "\"";
+                return false;
+            }
+            if (cfg.video_port < 1024 || cfg.video_port > 65535) {
+                err = "settings.dat line " + std::to_string(lineno)
+                    + ": video_port must be between 1024 and 65535";
+                return false;
+            }
+            got_vport = true;
+        }
+        else if (key == "input_port") {
+            try { cfg.input_port = std::stoi(val); }
+            catch (...) {
+                err = "settings.dat line " + std::to_string(lineno)
+                    + ": input_port is not a valid number: \"" + val + "\"";
+                return false;
+            }
+            if (cfg.input_port < 1024 || cfg.input_port > 65535) {
+                err = "settings.dat line " + std::to_string(lineno)
+                    + ": input_port must be between 1024 and 65535";
+                return false;
+            }
+            got_iport = true;
+        }
+        else if (key == "passphrase") {
+            cfg.passphrase = val;
+
+        }
+        else if (key == "connection") {
+            std::string upper = val;
+            for (char& ch : upper) ch = (char)toupper((unsigned char)ch);
+            if (upper == "WAN") {
+                cfg.wan_mode = true;
+            }
+            else if (upper == "LAN") {
+                cfg.wan_mode = false;
+            }
+            else {
+                err = "settings.dat line " + std::to_string(lineno)
+                    + ": connection must be LAN or WAN, got: \"" + val + "\"";
+                return false;
+            }
+        }
+        else if (key == "startup") {
+            std::string lower = val;
+            for (char& ch : lower) ch = (char)tolower((unsigned char)ch);
+            cfg.startup = (lower == "true" || lower == "1" || lower == "yes");
+        }
+
+    }
+
+    if (!got_vport) { err = "settings.dat: required key 'video_port' is missing"; return false; }
+    if (!got_iport) { err = "settings.dat: required key 'input_port' is missing"; return false; }
+    if (cfg.video_port == cfg.input_port) {
+        err = "settings.dat: video_port and input_port must be different values";
+        return false;
+    }
+
+    return true;
+}
+
+static const uint8_t PKT_HANDSHAKE = 0x01;
+static const uint8_t PKT_HANDSHAKE_ACK = 0x02;
+static const uint8_t PKT_HANDSHAKE_DENY = 0x03;
+static const uint8_t PKT_VIDEO_FRAME = 0x04;
+static const uint8_t PKT_HEARTBEAT = 0x05;
+static const uint8_t PKT_HEARTBEAT_ACK = 0x06;
+static const uint8_t PKT_MOUSE_EVENT = 0x10;
+static const uint8_t PKT_KEY_EVENT = 0x11;
+static const uint8_t PKT_DISCONNECT = 0xFF;
+
+static const int   FPS_TARGET = 30;
+static const ULONG JPEG_QUAL = 50;
+
+static bool send_all(SOCKET s, const void* buf, int len) {
+    const char* p = (const char*)buf;
+    while (len > 0) { int r = send(s, p, len, 0); if (r <= 0) return false; p += r; len -= r; }
+    return true;
+}
+static bool recv_all(SOCKET s, void* buf, int len) {
+    char* p = (char*)buf;
+    while (len > 0) { int r = recv(s, p, len, 0); if (r <= 0) return false; p += r; len -= r; }
+    return true;
+}
+static bool send_packet(SOCKET s, uint8_t type, const void* data, uint32_t dlen) {
+    uint8_t hdr[5]; hdr[0] = type;
+    uint32_t nl = htonl(dlen); memcpy(hdr + 1, &nl, 4);
+    if (!send_all(s, hdr, 5)) return false;
+    if (data && dlen) return send_all(s, data, (int)dlen);
+    return true;
+}
+static bool send_packet_empty(SOCKET s, uint8_t type) { return send_packet(s, type, NULL, 0); }
+
+struct Packet { uint8_t type; std::vector<uint8_t> data; };
+static bool recv_packet(SOCKET s, Packet& pkt) {
+    uint8_t hdr[5]; if (!recv_all(s, hdr, 5)) return false;
+    uint32_t nl; memcpy(&nl, hdr + 1, 4); uint32_t len = ntohl(nl);
+    pkt.type = hdr[0]; pkt.data.resize(len);
+    if (len > 0 && !recv_all(s, pkt.data.data(), (int)len)) return false;
+    return true;
+}
+
+static ULONG_PTR g_gdiplus_token = 0;
+static CLSID     g_jpeg_clsid;
+
+static bool FindJpegClsid(CLSID* out) {
+    UINT num = 0, sz = 0; GetImageEncodersSize(&num, &sz);
+    if (!sz) return false;
+    std::vector<uint8_t> buf(sz);
+    ImageCodecInfo* p = (ImageCodecInfo*)buf.data();
+    GetImageEncoders(num, sz, p);
+    for (UINT i = 0; i < num; i++)
+        if (wcscmp(p[i].MimeType, L"image/jpeg") == 0) { *out = p[i].Clsid; return true; }
+    return false;
+}
+
+static std::vector<uint8_t> CaptureScreenJpeg() {
+    HDC hdcScr = GetDC(NULL);
+    int sw = GetDeviceCaps(hdcScr, DESKTOPHORZRES);
+    int sh = GetDeviceCaps(hdcScr, DESKTOPVERTRES);
+    if (sw <= 0) sw = GetSystemMetrics(SM_CXSCREEN);
+    if (sh <= 0) sh = GetSystemMetrics(SM_CYSCREEN);
+
+    HDC     hdcMem = CreateCompatibleDC(hdcScr);
+    HBITMAP hbmp = CreateCompatibleBitmap(hdcScr, sw, sh);
+    HGDIOBJ hOld = SelectObject(hdcMem, hbmp);
+    BitBlt(hdcMem, 0, 0, sw, sh, hdcScr, 0, 0, SRCCOPY);
+
+    HFONT hf = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HGDIOBJ hOldF = SelectObject(hdcMem, hf);
+    SetBkMode(hdcMem, TRANSPARENT);
+    SetTextColor(hdcMem, RGB(255, 60, 60));
+    TextOutW(hdcMem, 8, 8, L"[REMOTE SESSION ACTIVE]", 23);
+    SelectObject(hdcMem, hOldF); DeleteObject(hf);
+
+    SelectObject(hdcMem, hOld); DeleteDC(hdcMem); ReleaseDC(NULL, hdcScr);
+
+    Bitmap bmp(hbmp, NULL);
+    EncoderParameters ep; memset(&ep, 0, sizeof(ep));
+    ep.Count = 1; ep.Parameter[0].Guid = EncoderQuality;
+    ep.Parameter[0].Type = EncoderParameterValueTypeLong;
+    ep.Parameter[0].NumberOfValues = 1; ULONG q = JPEG_QUAL;
+    ep.Parameter[0].Value = &q;
+
+    IStream* pStream = NULL; CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+    bmp.Save(pStream, &g_jpeg_clsid, &ep);
+    STATSTG st; memset(&st, 0, sizeof(st)); pStream->Stat(&st, STATFLAG_NONAME);
+    ULONG fsz = st.cbSize.LowPart;
+    std::vector<uint8_t> jpeg(fsz);
+    LARGE_INTEGER zero; zero.QuadPart = 0; pStream->Seek(zero, STREAM_SEEK_SET, NULL);
+    ULONG nr = 0; pStream->Read(jpeg.data(), fsz, &nr);
+    pStream->Release(); DeleteObject(hbmp);
+    return jpeg;
+}
+
+static std::atomic<bool> g_running(false);
+static std::atomic<bool> g_session_active(false);
+static SOCKET      g_video_sock = INVALID_SOCKET;
+static SOCKET      g_input_sock = INVALID_SOCKET;
+static std::string g_ctrl_name;
+static HWND        g_status_hwnd = NULL;
+static bool        g_tray_added = false;
+static NOTIFYICONDATA g_nid;
+
+static void VideoStreamThread() {
+    using namespace std::chrono;
+    const milliseconds frame_ms(1000 / FPS_TARGET);
+    Log("VIDEO: Streaming started\n");
+
+    while (g_running && g_session_active) {
+        auto t0 = steady_clock::now();
+
+        std::vector<uint8_t> jpeg = CaptureScreenJpeg();
+        if (!jpeg.empty()) {
+            POINT cur = { 0, 0 }; GetCursorPos(&cur);
+            HDC tmp = GetDC(NULL);
+            int sw = GetDeviceCaps(tmp, DESKTOPHORZRES);
+            int sh = GetDeviceCaps(tmp, DESKTOPVERTRES);
+            ReleaseDC(NULL, tmp);
+            if (sw <= 0) sw = GetSystemMetrics(SM_CXSCREEN);
+            if (sh <= 0) sh = GetSystemMetrics(SM_CYSCREEN);
+
+            int nx = sw ? (int)(((double)cur.x / sw) * 65535) : 0;
+            int ny = sh ? (int)(((double)cur.y / sh) * 65535) : 0;
+            nx = max(0, min(65535, nx));
+            ny = max(0, min(65535, ny));
+            uint32_t nnx = htonl((uint32_t)nx);
+            uint32_t nny = htonl((uint32_t)ny);
+
+            std::vector<uint8_t> payload(8 + jpeg.size());
+            memcpy(payload.data() + 0, &nnx, 4);
+            memcpy(payload.data() + 4, &nny, 4);
+            memcpy(payload.data() + 8, jpeg.data(), jpeg.size());
+
+            CryptVideoSend(payload);
+
+            if (!send_packet(g_video_sock, PKT_VIDEO_FRAME,
+                payload.data(), (uint32_t)payload.size())) {
+                Log("VIDEO: Send failed\n");
+                break;
+            }
+        }
+
+        auto elapsed = duration_cast<milliseconds>(steady_clock::now() - t0);
+        if (elapsed < frame_ms) std::this_thread::sleep_for(frame_ms - elapsed);
+    }
+
+    Log("VIDEO: Streaming ended\n");
+    g_session_active = false;
+}
+
+static void HeartbeatThread() {
+    while (g_running && g_session_active) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (!g_session_active) break;
+        if (!send_packet_empty(g_video_sock, PKT_HEARTBEAT)) break;
+    }
+}
+
+static void InputThread() {
+    Log("INPUT: Listening\n");
+    HDC tmp = GetDC(NULL);
+    int phys_w = GetDeviceCaps(tmp, DESKTOPHORZRES);
+    int phys_h = GetDeviceCaps(tmp, DESKTOPVERTRES);
+    ReleaseDC(NULL, tmp);
+    if (phys_w <= 0) phys_w = GetSystemMetrics(SM_CXSCREEN);
+    if (phys_h <= 0) phys_h = GetSystemMetrics(SM_CYSCREEN);
+    double abs_x = phys_w / 2.0, abs_y = phys_h / 2.0;
+
+    while (g_running && g_session_active) {
+        Packet pkt;
+        if (!recv_packet(g_input_sock, pkt)) break;
+        if (pkt.type == PKT_DISCONNECT) break;
+
+        CryptInputRecv(pkt.data);
+
+        if (pkt.type == PKT_MOUSE_EVENT && pkt.data.size() >= 12) {
+            int16_t rx = 0, ry = 0;
+            char ev[5] = {}, bt[5] = {};
+            memcpy(&rx, pkt.data.data() + 0, 2);
+            memcpy(&ry, pkt.data.data() + 2, 2);
+            memcpy(ev, pkt.data.data() + 4, 4);
+            memcpy(bt, pkt.data.data() + 8, 4);
+            rx = (int16_t)ntohs(*(uint16_t*)&rx);
+            ry = (int16_t)ntohs(*(uint16_t*)&ry);
+            std::string evt(ev), btn(bt);
+
+            INPUT inp; memset(&inp, 0, sizeof(inp)); inp.type = INPUT_MOUSE;
+            if (evt == "rel ") {
+                abs_x += rx; abs_y += ry;
+                double cx = max(0.0, min((double)(phys_w - 1), abs_x));
+                double cy = max(0.0, min((double)(phys_h - 1), abs_y));
+                inp.mi.dx = (LONG)((cx / phys_w) * 65535.0);
+                inp.mi.dy = (LONG)((cy / phys_h) * 65535.0);
+                inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            }
+            else if (evt == "down") {
+                if (btn.substr(0, 4) == "left") inp.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+                else if (btn.substr(0, 4) == "righ")  inp.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+                else if (btn.substr(0, 4) == "midd")  inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+            }
+            else if (evt == "up  ") {
+                if (btn.substr(0, 4) == "left") inp.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+                else if (btn.substr(0, 4) == "righ")  inp.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+                else if (btn.substr(0, 4) == "midd")  inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+            }
+            else if (evt == "scro") {
+                inp.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                int d = 0; try { d = std::stoi(std::string(bt)); }
+                catch (...) {}
+                inp.mi.mouseData = (DWORD)(d * WHEEL_DELTA);
+            }
+            if (inp.mi.dwFlags) SendInput(1, &inp, sizeof(INPUT));
+        }
+        else if (pkt.type == PKT_KEY_EVENT && pkt.data.size() >= 5) {
+            uint32_t vkn = 0; memcpy(&vkn, pkt.data.data(), 4);
+            uint8_t pressed = pkt.data[4];
+            WORD vk = (WORD)ntohl(vkn);
+            WORD sc = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+            static const WORD ext[] = {
+                VK_RMENU, VK_RCONTROL, VK_RSHIFT,
+                VK_INSERT, VK_DELETE, VK_HOME, VK_END,
+                VK_PRIOR, VK_NEXT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT,
+                VK_NUMLOCK, VK_CANCEL, VK_SNAPSHOT, VK_DIVIDE,
+                VK_LWIN, VK_RWIN, VK_APPS
+            };
+            bool isExt = false;
+            for (WORD e : ext) if (vk == e) { isExt = true; break; }
+            INPUT inp; memset(&inp, 0, sizeof(inp)); inp.type = INPUT_KEYBOARD;
+            inp.ki.wVk = vk;
+            inp.ki.wScan = sc;
+            inp.ki.dwFlags = 0;
+            if (!pressed) inp.ki.dwFlags |= KEYEVENTF_KEYUP;
+            if (isExt)    inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            SendInput(1, &inp, sizeof(INPUT));
+        }
+    }
+
+    Log("INPUT: Thread ended\n");
+    g_session_active = false;
+}
+
+#define WM_TRAY_ICON   (WM_USER + 1)
+#define IDM_DISCONNECT  1001
+
+static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TRAY_ICON && (UINT)lp == WM_RBUTTONUP) {
+        POINT pt; GetCursorPos(&pt);
+        HMENU hm = CreatePopupMenu();
+        AppendMenuW(hm, MF_STRING, IDM_DISCONNECT, L"Disconnect remote session");
+        SetForegroundWindow(hwnd);
+        int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+        DestroyMenu(hm);
+        if (cmd == IDM_DISCONNECT) { Log("TRAY: Disconnect\n"); g_session_active = false; }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void AddTrayIcon(HWND hwnd) {
+    memset(&g_nid, 0, sizeof(g_nid)); g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd; g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAY_ICON;
+    g_nid.hIcon = LoadIcon(NULL, IDI_INFORMATION);
+    wcscpy_s(g_nid.szTip, L"Remote Desktop - Session Active");
+    Shell_NotifyIcon(NIM_ADD, &g_nid); g_tray_added = true;
+}
+static void RemoveTrayIcon() {
+    if (g_tray_added) { Shell_NotifyIcon(NIM_DELETE, &g_nid); g_tray_added = false; }
+}
+
+static bool        g_upnp_mapped = false;
+static std::string g_upnp_vid_desc;
+static std::string g_upnp_inp_desc;
+
+static LRESULT CALLBACK StatusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+
+        HBRUSH bg = CreateSolidBrush(RGB(20, 20, 20));
+        FillRect(hdc, &rc, bg); DeleteObject(bg);
+
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+        HGDIOBJ op = SelectObject(hdc, pen);
+        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        RoundRect(hdc, 0, 0, rc.right - 1, rc.bottom - 1, 8, 8);
+        SelectObject(hdc, op); SelectObject(hdc, ob); DeleteObject(pen);
+
+        SetBkMode(hdc, TRANSPARENT);
+        HFONT hf = CreateFontW(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HGDIOBJ of = SelectObject(hdc, hf);
+
+        SetTextColor(hdc, RGB(255, 80, 80));
+        RECT r1 = { 10, 8, rc.right - 10, 24 };
+        DrawTextW(hdc, L"  REMOTE SESSION ACTIVE", -1, &r1, DT_LEFT | DT_SINGLELINE);
+
+        SetTextColor(hdc, RGB(180, 180, 180));
+        std::wstring cl = L"    Controller: " +
+            std::wstring(g_ctrl_name.begin(), g_ctrl_name.end());
+        RECT r2 = { 10, 28, rc.right - 10, 44 };
+        DrawTextW(hdc, cl.c_str(), -1, &r2, DT_LEFT | DT_SINGLELINE);
+
+        SetTextColor(hdc, g_aes_enabled ? RGB(100, 220, 100) : RGB(200, 130, 50));
+        RECT r3 = { 10, 44, rc.right - 10, 58 };
+        DrawTextW(hdc,
+            g_aes_enabled ? L"    Encrypted (AES-128-CTR)" : L"    Unencrypted",
+            -1, &r3, DT_LEFT | DT_SINGLELINE);
+
+        SetTextColor(hdc, g_upnp_mapped ? RGB(100, 180, 255) : RGB(140, 140, 140));
+        RECT r4 = { 10, 58, rc.right - 10, 74 };
+        DrawTextW(hdc,
+            g_upnp_mapped ? L"    UPnP: ports forwarded" : L"    UPnP: not mapped (LAN only)",
+            -1, &r4, DT_LEFT | DT_SINGLELINE);
+
+        SetTextColor(hdc, RGB(80, 80, 80));
+        RECT r5 = { 10, 72, rc.right - 10, 88 };
+        DrawTextW(hdc, L"    Right-click tray to disconnect", -1, &r5, DT_LEFT | DT_SINGLELINE);
+
+        SelectObject(hdc, of); DeleteObject(hf);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void RunStatusWindow() {
+    HINSTANCE hInst = GetModuleHandle(NULL);
+    WNDCLASSW wc; memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = StatusWndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"RemoteHostStatus";
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassW(&wc);
+
+    DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    int winW = 280, winH = 96;
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+
+    HWND hwnd = CreateWindowExW(exStyle, L"RemoteHostStatus",
+        L"Remote Desktop - Session Active", WS_POPUP,
+        10, scrH - winH - 10, winW, winH,
+        NULL, NULL, hInst, NULL);
+
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), (BYTE)(255 * 0.70), LWA_ALPHA);
+    g_status_hwnd = hwnd;
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd);
+    AddTrayIcon(hwnd);
+
+    MSG wmsg;
+    while (GetMessage(&wmsg, NULL, 0, 0) > 0) {
+        TranslateMessage(&wmsg);
+        DispatchMessage(&wmsg);
+        if (!g_session_active) { DestroyWindow(hwnd); break; }
+    }
+
+    RemoveTrayIcon();
+    g_status_hwnd = NULL;
+}
+
+static bool ShowConsentDialog(const std::string& ctrl_name) {
+    std::wstring wn(ctrl_name.begin(), ctrl_name.end());
+    std::wstring msg =
+        L"A remote controller is requesting access.\n\n"
+        L"Name: " + wn + L"\n\n"
+        L"If you allow:\n"
+        L"  - Your screen will be streamed.\n"
+        L"  - They can control your mouse and keyboard\n"
+        L"  - A red watermark will appear on your screen\n"
+        L"Do you want to allow this connection?";
+    return MessageBoxW(NULL, msg.c_str(),
+        L"Remote Desktop - Access Request",
+        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+}
+
+static BSTR GetLocalIPBSTR()
+{
+    char hostname[256] = {};
+    gethostname(hostname, sizeof(hostname));
+    struct addrinfo hints {}, * res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    std::string localIP = "0.0.0.0";
+    if (getaddrinfo(hostname, nullptr, &hints, &res) == 0 && res) {
+        char ipbuf[INET_ADDRSTRLEN] = {};
+        sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(res->ai_addr);
+        inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof(ipbuf));
+        localIP = ipbuf;
+        freeaddrinfo(res);
+    }
+    int wlen = MultiByteToWideChar(CP_ACP, 0, localIP.c_str(), -1, nullptr, 0);
+    std::wstring wip(wlen, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, localIP.c_str(), -1, &wip[0], wlen);
+    return SysAllocString(wip.c_str());
+}
+
+static bool UPnPAddMapping(IStaticPortMappingCollection* pColl,
+    int port, const char* desc)
+{
+    BSTR bProto = SysAllocString(L"TCP");
+    BSTR bDesc = nullptr;
+    {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, desc, -1, nullptr, 0);
+        std::wstring wd(wlen, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, desc, -1, &wd[0], wlen);
+        bDesc = SysAllocString(wd.c_str());
+    }
+    BSTR bLocalIP = GetLocalIPBSTR();
+
+    IStaticPortMapping* pMap = nullptr;
+    HRESULT hr = pColl->Add(
+        (long)port,
+
+        bProto,
+        (long)port,
+
+        bLocalIP,
+        VARIANT_TRUE,
+
+        bDesc,
+        &pMap);
+
+    SysFreeString(bProto);
+    SysFreeString(bDesc);
+    SysFreeString(bLocalIP);
+    if (pMap) pMap->Release();
+
+    return SUCCEEDED(hr);
+}
+
+static void UPnPRemoveMapping(IStaticPortMappingCollection* pColl, int port)
+{
+    BSTR bProto = SysAllocString(L"TCP");
+    pColl->Remove((long)port, bProto);
+    SysFreeString(bProto);
+}
+
+static std::string UPnPOpenPorts(int video_port, int input_port)
+{
+    g_upnp_mapped = false;
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IUPnPNAT* pNAT = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(UPnPNAT), nullptr,
+        CLSCTX_ALL, __uuidof(IUPnPNAT), (void**)&pNAT);
+    if (FAILED(hr) || !pNAT)
+        return "UPnP: CoCreateInstance failed (NAT COM not available)";
+
+    IStaticPortMappingCollection* pColl = nullptr;
+    hr = pNAT->get_StaticPortMappingCollection(&pColl);
+    pNAT->Release();
+    if (FAILED(hr) || !pColl)
+        return "UPnP: No IGD found on this network (router may not support UPnP)";
+
+    g_upnp_vid_desc = "RDHost-Video-" + std::to_string(video_port);
+    g_upnp_inp_desc = "RDHost-Input-" + std::to_string(input_port);
+
+    bool ok_vid = UPnPAddMapping(pColl, video_port, g_upnp_vid_desc.c_str());
+    bool ok_inp = UPnPAddMapping(pColl, input_port, g_upnp_inp_desc.c_str());
+    pColl->Release();
+
+    if (ok_vid && ok_inp) {
+        g_upnp_mapped = true;
+        return "UPnP: Ports " + std::to_string(video_port) +
+            " & " + std::to_string(input_port) + " forwarded via IGD";
+    }
+    if (ok_vid || ok_inp)
+        return "UPnP: Partial mapping (one port may be blocked by router)";
+    return "UPnP: Mapping failed (check router UPnP settings)";
+}
+
+static void UPnPClosePorts(int video_port, int input_port)
+{
+    if (!g_upnp_mapped) return;
+    g_upnp_mapped = false;
+
+    IUPnPNAT* pNAT = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(UPnPNAT), nullptr,
+        CLSCTX_ALL, __uuidof(IUPnPNAT), (void**)&pNAT);
+    if (FAILED(hr) || !pNAT) return;
+
+    IStaticPortMappingCollection* pColl = nullptr;
+    hr = pNAT->get_StaticPortMappingCollection(&pColl);
+    pNAT->Release();
+    if (FAILED(hr) || !pColl) return;
+
+    UPnPRemoveMapping(pColl, video_port);
+    UPnPRemoveMapping(pColl, input_port);
+    pColl->Release();
+    Log("UPnP: Port mappings removed\n");
+}
+
+static bool AcceptSession(SOCKET vid_listen, SOCKET inp_listen) {
+    Log("\nHOST: Waiting for controller...\n");
+    sockaddr_in addr; memset(&addr, 0, sizeof(addr)); int al = sizeof(addr);
+
+    SOCKET is = accept(inp_listen, (sockaddr*)&addr, &al);
+    if (is == INVALID_SOCKET) { Log("HOST: Input accept failed\n"); return false; }
+
+    SOCKET vs = accept(vid_listen, (sockaddr*)&addr, &al);
+    if (vs == INVALID_SOCKET) { closesocket(is); return false; }
+
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    Log(std::string("HOST: Connection from ") + ip + "\n");
+
+    Packet pkt;
+    if (!recv_packet(vs, pkt) || pkt.type != PKT_HANDSHAKE) {
+        closesocket(vs); closesocket(is); return false;
+    }
+    std::string name(pkt.data.begin(), pkt.data.end());
+    size_t nul = name.find('\0'); if (nul != std::string::npos) name = name.substr(0, nul);
+    Log("HOST: Handshake from \"" + name + "\"\n");
+
+    if (!ShowConsentDialog(name)) {
+        const char* d = "Denied by user";
+        send_packet(vs, PKT_HANDSHAKE_DENY, d, (uint32_t)strlen(d));
+        closesocket(vs); closesocket(is);
+        Log("HOST: Denied\n");
+        return false;
+    }
+
+    g_aes_vid_send_ctr = 0;
+    g_aes_inp_recv_ctr = 0;
+
+    send_packet_empty(vs, PKT_HANDSHAKE_ACK);
+    g_video_sock = vs;
+    g_input_sock = is;
+    g_ctrl_name = name;
+    g_session_active = true;
+    Log("HOST: Session started for \"" + name + "\"\n");
+    return true;
+}
+
+static const wchar_t* STARTUP_REG_KEY =
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* STARTUP_VALUE_NAME = L"RemoteDesktopHost";
+
+static bool IsInStartup()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_REG_KEY,
+        0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    wchar_t val[MAX_PATH] = {};
+    DWORD sz = sizeof(val);
+    DWORD type = 0;
+    LONG r = RegQueryValueExW(hKey, STARTUP_VALUE_NAME, NULL,
+        &type, (LPBYTE)val, &sz);
+    RegCloseKey(hKey);
+
+    if (r != ERROR_SUCCESS) return false;
+
+    return (_wcsicmp(val, exePath) == 0);
+}
+
+static bool SetStartupEntry(bool enable)
+{
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_REG_KEY,
+        0, KEY_WRITE, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    LONG r;
+    if (enable) {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        r = RegSetValueExW(hKey, STARTUP_VALUE_NAME, 0, REG_SZ,
+            (const BYTE*)exePath,
+            (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+    }
+    else {
+        r = RegDeleteValueW(hKey, STARTUP_VALUE_NAME);
+    }
+    RegCloseKey(hKey);
+    return (r == ERROR_SUCCESS);
+}
+
+static void HandleStartupRegistration()
+{
+    if (IsInStartup()) return;
+
+    int answer = MessageBoxW(
+        NULL,
+        L"This host is configured to register in Windows Startup\n"
+        L"Do you want to add it to your startup apps?\n\n"
+        L"(You can remove it later via Task Manager > Startup Apps)",
+        L"Remote Desktop Host - Startup Registration",
+        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
+
+    if (answer == IDYES) {
+        if (SetStartupEntry(true))
+            Log("HOST: Registered in Windows startup\n");
+        else
+            Log("HOST: Failed to register in Windows startup (registry write error)\n");
+    }
+    else {
+        Log("HOST: User declined startup registration\n");
+    }
+}
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+{
+    LogInit();
+
+    HostConfig cfg;
+    std::string settingsError;
+    if (!LoadSettings(cfg, settingsError)) {
+        std::wstring werr(settingsError.begin(), settingsError.end());
+        MessageBoxW(NULL, werr.c_str(),
+            L"Remote Desktop Host - Configuration Error",
+            MB_OK | MB_ICONERROR | MB_TOPMOST);
+        LogShutdown();
+        return 1;
+    }
+
+    Log("HOST: Config OK — video=" + std::to_string(cfg.video_port)
+        + " input=" + std::to_string(cfg.input_port)
+        + (cfg.wan_mode ? " mode=WAN" : " mode=LAN")
+        + (cfg.startup ? " startup=yes" : " startup=no")
+        + (cfg.passphrase.empty() ? " enc=off" : " enc=AES-128-CTR") + "\n");
+
+    if (cfg.startup) HandleStartupRegistration();
+
+    if (!cfg.passphrase.empty()) {
+        uint8_t key[16];
+        AES128::DeriveKey(cfg.passphrase, key);
+        AES128::KeyExpansion(key, g_aes_ctx.rk);
+        g_aes_enabled = true;
+    }
+    else {
+        g_aes_enabled = false;
+    }
+
+    WSADATA wsa; memset(&wsa, 0, sizeof(wsa));
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        MessageBoxW(NULL, L"WSAStartup failed.",
+            L"Remote Desktop Host - Error", MB_OK | MB_ICONERROR);
+        LogShutdown(); return 1;
+    }
+    GdiplusStartupInput gsi;
+    GdiplusStartup(&g_gdiplus_token, &gsi, NULL);
+    FindJpegClsid(&g_jpeg_clsid);
+
+    auto make_listener = [](int port) -> SOCKET {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return INVALID_SOCKET;
+        int opt = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+        sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons((u_short)port);
+        if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            closesocket(s); return INVALID_SOCKET;
+        }
+        listen(s, 1);
+        return s;
+        };
+
+    SOCKET vid_listen = make_listener(cfg.video_port);
+    SOCKET inp_listen = make_listener(cfg.input_port);
+
+    if (vid_listen == INVALID_SOCKET || inp_listen == INVALID_SOCKET) {
+        MessageBoxW(NULL,
+            L"Failed to bind listening sockets.\n\n"
+            L"Possible causes:\n"
+            L"  - Another instance is already running\n"
+            L"  - The port is in use by another application\n"
+            L"  - Windows Firewall is blocking the port",
+            L"Remote Desktop Host - Network Error",
+            MB_OK | MB_ICONERROR | MB_TOPMOST);
+        WSACleanup(); LogShutdown(); return 1;
+    }
+
+    Log("HOST: Listening on video=" + std::to_string(cfg.video_port)
+        + " input=" + std::to_string(cfg.input_port) + "\n");
+
+    if (cfg.wan_mode) {
+        std::string upnpResult = UPnPOpenPorts(cfg.video_port, cfg.input_port);
+        Log("HOST: " + upnpResult + "\n");
+    }
+    else {
+        Log("HOST: LAN mode — skipping UPnP port forwarding\n");
+    }
+
+    g_running = true;
+    while (g_running) {
+        if (!AcceptSession(vid_listen, inp_listen)) continue;
+
+        std::thread t_vid(VideoStreamThread);
+        std::thread t_hb(HeartbeatThread);
+        std::thread t_inp(InputThread);
+        std::thread t_ui(RunStatusWindow);
+
+        t_vid.join(); t_hb.join(); t_inp.join();
+
+        g_session_active = false;
+        if (g_status_hwnd) PostMessage(g_status_hwnd, WM_DESTROY, 0, 0);
+        t_ui.join();
+
+        if (g_video_sock != INVALID_SOCKET) { closesocket(g_video_sock); g_video_sock = INVALID_SOCKET; }
+        if (g_input_sock != INVALID_SOCKET) { closesocket(g_input_sock); g_input_sock = INVALID_SOCKET; }
+        g_ctrl_name.clear();
+        Log("HOST: Session ended. Waiting for next connection...\n");
+    }
+
+    if (cfg.wan_mode) UPnPClosePorts(cfg.video_port, cfg.input_port);
+    CoUninitialize();
+
+    closesocket(vid_listen);
+    closesocket(inp_listen);
+    GdiplusShutdown(g_gdiplus_token);
+    WSACleanup();
+    Log("HOST: Shut down cleanly\n");
+    LogShutdown();
+    return 0;
+}
