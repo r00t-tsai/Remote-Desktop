@@ -27,8 +27,11 @@
 #include <cmath>
 #include <fstream>
 #include <commdlg.h>
+#include <mmsystem.h>
+#include <mmreg.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -44,12 +47,14 @@ static constexpr uint8_t PKT_HANDSHAKE_DENY = 0x03;
 static constexpr uint8_t PKT_VIDEO_FRAME = 0x04;
 static constexpr uint8_t PKT_HEARTBEAT = 0x05;
 static constexpr uint8_t PKT_HEARTBEAT_ACK = 0x06;
+static constexpr uint8_t PKT_AUDIO_FRAME = 0x12;
 static constexpr uint8_t PKT_MOUSE_EVENT = 0x10;
 static constexpr uint8_t PKT_KEY_EVENT = 0x11;
 static constexpr uint8_t PKT_DISCONNECT = 0xFF;
 
 static int VIDEO_PORT = 55000;
 static int INPUT_PORT = 55001;
+static int AUDIO_PORT = 55002;
 
 namespace AES128 {
     static const uint8_t SBOX[256] = {
@@ -163,6 +168,8 @@ static void CryptInputSend(std::vector<uint8_t>& buf) {
 static constexpr int ID_BTN_CONNECT = 101;
 static constexpr int ID_BTN_DISCONNECT = 102;
 static constexpr int ID_BTN_DEBUG = 103;
+static constexpr int ID_EDIT_APORT = 120;
+static constexpr int ID_BTN_VOLUME = 121;
 static constexpr int ID_EDIT_IP = 104;
 static constexpr int ID_EDIT_NAME = 105;
 
@@ -536,6 +543,110 @@ public:
     }
 };
 
+static float  g_audio_volume = 1.0f;
+
+static HANDLE g_audio_stop_evt = NULL;
+
+static void AudioPlaybackThread(SOCKET sock)
+{
+
+    WAVEFORMATEX wfx{};
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = 2;
+    wfx.nSamplesPerSec = 44100;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = 4;
+    wfx.nAvgBytesPerSec = 44100 * 4;
+
+    HWAVEOUT hwo = NULL;
+
+    bool waveout_open = false;
+
+    static constexpr int NUM = 4;
+    static constexpr int BSIZ = 8820;
+
+    std::vector<std::vector<int16_t>> rawbufs(NUM, std::vector<int16_t>(BSIZ / 2, 0));
+    WAVEHDR hdr[NUM]{};
+    int nxt = 0;
+
+    DWORD rto = 200;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&rto, sizeof(rto));
+
+    for (;;) {
+        if (g_audio_stop_evt &&
+            WaitForSingleObject(g_audio_stop_evt, 0) == WAIT_OBJECT_0) break;
+
+        uint8_t ph[5]; int got = 0;
+        while (got < 5) {
+            int r = recv(sock, (char*)ph + got, 5 - got, 0);
+            if (r <= 0) goto aud_done;
+            got += r;
+        }
+        uint8_t  ptype = ph[0];
+        uint32_t plen = 0; memcpy(&plen, ph + 1, 4); plen = ntohl(plen);
+        if (plen > 512 * 1024) break;
+
+        std::vector<uint8_t> body(plen);
+        got = 0;
+        while (got < (int)plen) {
+            int r = recv(sock, (char*)body.data() + got, (int)plen - got, 0);
+            if (r <= 0) goto aud_done;
+            got += r;
+        }
+
+        if (ptype == PKT_DISCONNECT) break;
+        if (ptype != PKT_AUDIO_FRAME || plen <= 4) continue;
+
+        uint32_t pktSR = 44100;
+        memcpy(&pktSR, body.data(), 4);
+        if (pktSR < 8000 || pktSR > 192000) pktSR = 44100;
+
+        if (!waveout_open) {
+            wfx.nSamplesPerSec = pktSR;
+            wfx.nAvgBytesPerSec = pktSR * 4;
+
+            if (waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
+                goto aud_done;
+            for (int i = 0; i < NUM; i++) {
+                hdr[i].lpData = (LPSTR)rawbufs[i].data();
+                hdr[i].dwBufferLength = BSIZ;
+                waveOutPrepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
+                hdr[i].dwFlags |= WHDR_DONE;
+            }
+            waveout_open = true;
+        }
+
+        size_t nBytes = plen - 4;
+        size_t nSamples = nBytes / 2;
+        const int16_t* src = reinterpret_cast<const int16_t*>(body.data() + 4);
+
+        WAVEHDR& wh = hdr[nxt];
+        for (int w = 0; w < 500 && !(wh.dwFlags & WHDR_DONE); w++) Sleep(1);
+        if (!(wh.dwFlags & WHDR_DONE)) continue;
+
+        float vol = g_audio_volume;
+        size_t copyBytes = (nBytes < BSIZ) ? nBytes : BSIZ;
+        size_t copySamples = copyBytes / 2;
+        int16_t* dst = rawbufs[nxt].data();
+        for (size_t i = 0; i < copySamples; i++) {
+            float s = src[i] * vol;
+            dst[i] = (int16_t)(s > 32767.f ? 32767 : s < -32768.f ? -32768 : s);
+        }
+        wh.dwBufferLength = (DWORD)copyBytes;
+        wh.dwFlags &= ~WHDR_DONE;
+        waveOutWrite(hwo, &wh, sizeof(WAVEHDR));
+        nxt = (nxt + 1) % NUM;
+    }
+aud_done:
+    if (waveout_open && hwo) {
+        waveOutReset(hwo);
+        for (int i = 0; i < NUM; i++) waveOutUnprepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
+        waveOutClose(hwo);
+    }
+    shutdown(sock, SD_BOTH);
+    closesocket(sock);
+}
+
 class ControllerApp {
 public:
     HWND hwnd = NULL;
@@ -576,6 +687,8 @@ public:
     void tick_spinner();
     void show_late_label();
     void export_settings();
+    void show_volume_menu();
+    void set_volume_level(int cmd_id);
     void update_ip_placeholder();
 
     HWND hChkStartup = NULL;
@@ -584,6 +697,9 @@ public:
 
     std::unique_ptr<VideoConnection> video_conn;
     std::unique_ptr<InputConnection> input_conn;
+    std::thread audio_thread;
+    HWND        hBtnVolume = NULL;
+    int         volumePct = 100;
 
     std::mutex   frame_mutex;
     std::unique_ptr<PendingFrame> pending_frame;
@@ -905,9 +1021,12 @@ LRESULT ControllerApp::handle_message(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case ID_BTN_CONNECT:    on_connect();       break;
+        case ID_BTN_CONNECT:    on_connect();        break;
         case ID_BTN_DISCONNECT: on_disconnect_btn(); break;
         case ID_BTN_DEBUG:      toggle_debug();      break;
+        case ID_BTN_VOLUME:     show_volume_menu();  break;
+        case 501: case 502: case 503: case 504: case 505: case 506:
+            set_volume_level(LOWORD(wp)); break;
         case ID_OVERLAY_CANCEL: cancel_connect();    break;
         case ID_BTN_EXPORT:     export_settings();  break;
         case ID_CHK_INTERNET:
@@ -961,17 +1080,25 @@ LRESULT ControllerApp::handle_message(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_FRAME:
         render_frame();
         return 0;
-
     case WM_APP_DISCONN:
         on_disconnected();
         return 0;
 
-    case WM_APP_CONNECTED:
+    case WM_APP_CONNECTED: {
+        SOCKET aud_sock = (SOCKET)wp;
         hide_loading_overlay();
         ShowWindow(hConnectWnd, SW_HIDE);
         create_session_window();
         hwnd = hSessionWnd;
+
+        if (aud_sock != INVALID_SOCKET) {
+            if (g_audio_stop_evt) { CloseHandle(g_audio_stop_evt); }
+            g_audio_stop_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (audio_thread.joinable()) audio_thread.join();
+            audio_thread = std::thread(AudioPlaybackThread, aud_sock);
+        }
         return 0;
+    }
 
     case WM_SIZE: {
         RECT rc; GetClientRect(h, &rc);
@@ -982,8 +1109,9 @@ LRESULT ControllerApp::handle_message(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             SetWindowPos(hStatusBar, NULL, 0, H - sbH, W, sbH, SWP_NOZORDER);
             SetWindowPos(hCanvas, NULL, 0, barH, W, std::max(1, H - barH - sbH), SWP_NOZORDER);
             MoveWindow(hBtnDisconn, 5, 5, 95, 26, TRUE);
-            MoveWindow(hBtnDebug, 106, 5, 90, 26, TRUE);
-            if (hLockLabel) MoveWindow(hLockLabel, 205, 9, W - 210, 18, TRUE);
+            if (hBtnVolume) MoveWindow(hBtnVolume, 106, 5, 72, 26, TRUE);
+            MoveWindow(hBtnDebug, 184, 5, 90, 26, TRUE);
+            if (hLockLabel) MoveWindow(hLockLabel, 280, 9, W - 285, 18, TRUE);
             InvalidateRect(hCanvas, NULL, FALSE);
         }
         return 0;
@@ -1035,7 +1163,7 @@ bool ControllerApp::init(HINSTANCE hInst)
 
     const int CW = 420;
 
-    const int CH = 442;
+    const int CH = 468;
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = 0;
@@ -1141,6 +1269,10 @@ bool ControllerApp::init(HINSTANCE hInst)
 
     lbl_np(L"Input port:", col0, y + 3, col1 - col0 - 4, 17);
     edt(L"55001", ID_EDIT_IPORT, col1, y, 88, 22, ES_NUMBER);
+    y += rowH;
+
+    lbl_np(L"Audio port:", col0, y + 3, col1 - col0 - 4, 17);
+    edt(L"55002", ID_EDIT_APORT, col1, y, 88, 22, ES_NUMBER);
     y += rowH;
 
     chk(L"WAN Discovery  (hostname or public IP)",
@@ -1406,9 +1538,10 @@ void ControllerApp::create_session_window()
         };
 
     hBtnDisconn = btn(L"Disconnect", ID_BTN_DISCONNECT, 5, 5, 95, 26);
-    hBtnDebug = btn(L"Debug (F12)", ID_BTN_DEBUG, 106, 5, 90, 26);
+    hBtnVolume = btn(L"Volume", ID_BTN_VOLUME, 106, 5, 72, 26);
+    hBtnDebug = btn(L"Debug (F12)", ID_BTN_DEBUG, 184, 5, 90, 26);
     hLockLabel = lbl(L"Click inside stream to lock cursor  |  ESC to unlock",
-        205, 9, 500, 18);
+        280, 9, 500, 18);
 
     hCanvas = CreateWindowExW(0, L"RDCanvasCls", NULL,
         WS_CHILD | WS_VISIBLE,
@@ -1459,24 +1592,29 @@ void ControllerApp::on_connect()
 {
     if (!show_consent_dialog()) return;
 
-    wchar_t ip_buf[128] = {}, name_buf[64] = {}, vport_buf[8] = {}, iport_buf[8] = {}, pass_buf[128] = {};
+    wchar_t ip_buf[128] = {}, name_buf[64] = {}, vport_buf[8] = {}, iport_buf[8] = {}, aport_buf[8] = {}, pass_buf[128] = {};
     GetWindowTextW(hEditIP, ip_buf, 128);
     GetWindowTextW(hEditName, name_buf, 64);
 
     HWND hVportEdit = GetDlgItem(hConnectWnd, ID_EDIT_VPORT);
     HWND hIportEdit = GetDlgItem(hConnectWnd, ID_EDIT_IPORT);
+    HWND hAportEdit = GetDlgItem(hConnectWnd, ID_EDIT_APORT);
     HWND hPassEdit = GetDlgItem(hConnectWnd, ID_EDIT_PASS);
     if (hVportEdit) GetWindowTextW(hVportEdit, vport_buf, 8);
     if (hIportEdit) GetWindowTextW(hIportEdit, iport_buf, 8);
+    if (hAportEdit) GetWindowTextW(hAportEdit, aport_buf, 8);
     if (hPassEdit)  GetWindowTextW(hPassEdit, pass_buf, 128);
 
     int vport = _wtoi(vport_buf);
     int iport = _wtoi(iport_buf);
+    int aport = _wtoi(aport_buf);
     if (vport < 1024 || vport > 65535) vport = 55000;
     if (iport < 1024 || iport > 65535) iport = 55001;
+    if (aport < 1024 || aport > 65535) aport = 55002;
 
     VIDEO_PORT = vport;
     INPUT_PORT = iport;
+    AUDIO_PORT = aport;
 
     std::wstring wpass(pass_buf);
     std::string passphrase(wpass.begin(), wpass.end());
@@ -1540,7 +1678,7 @@ void ControllerApp::on_connect()
 
     HWND postTarget = hConnectWnd;
 
-    std::thread([this, host, name, postTarget, vport, iport, over_internet]() {
+    std::thread([this, host, name, postTarget, vport, iport, aport, over_internet]() {
 
         auto ic = std::make_unique<InputConnection>(host);
         ic->input_port = iport;
@@ -1664,7 +1802,9 @@ void ControllerApp::on_connect()
         video_conn = std::move(vc);
         input_conn = std::move(ic);
 
-        PostMessage(postTarget, WM_APP_CONNECTED, 0, 0);
+        SOCKET audio_sock = nb_connect(aport);
+        PostMessage(postTarget, WM_APP_CONNECTED,
+            (WPARAM)(audio_sock != INVALID_SOCKET ? audio_sock : (SOCKET)INVALID_SOCKET), 0);
         }).detach();
 }
 
@@ -1691,6 +1831,9 @@ void ControllerApp::destroy_session_window()
 
     if (video_conn) { video_conn->disconnect(); video_conn.reset(); }
     if (input_conn) { input_conn->disconnect(); input_conn.reset(); }
+    if (g_audio_stop_evt) SetEvent(g_audio_stop_evt);
+    if (audio_thread.joinable()) audio_thread.join();
+    if (g_audio_stop_evt) { CloseHandle(g_audio_stop_evt); g_audio_stop_evt = NULL; }
     {
         std::lock_guard<std::mutex> lk(frame_mutex);
         pending_frame.reset();
@@ -1703,6 +1846,7 @@ void ControllerApp::destroy_session_window()
     hSessionWnd = NULL;
     hCanvas = NULL;
     hBtnDisconn = NULL;
+    hBtnVolume = NULL;
     hBtnDebug = NULL;
     hLockLabel = NULL;
 
@@ -2179,21 +2323,57 @@ void ControllerApp::update_debug()
             });
 }
 
+void ControllerApp::show_volume_menu()
+{
+    if (!hBtnVolume) return;
+    RECT rc; GetWindowRect(hBtnVolume, &rc);
+    HMENU hm = CreatePopupMenu();
+    static const struct { int pct; const wchar_t* label; } kLevels[] = {
+        {100, L"100% – Full"}, {75, L"75%"}, {50, L"50%"},
+        {25,  L"25%"}, {10, L"10%"}, {0, L"Mute"}
+    };
+    for (int i = 0; i < 6; i++) {
+        UINT fl = MF_STRING | (volumePct == kLevels[i].pct ? MF_CHECKED : 0);
+        AppendMenuW(hm, fl, 501 + i, kLevels[i].label);
+    }
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hm, TPM_LEFTALIGN | TPM_TOPALIGN, rc.left, rc.bottom, 0, hwnd, NULL);
+    DestroyMenu(hm);
+}
+
+void ControllerApp::set_volume_level(int cmd_id)
+{
+    static const int kPct[] = { 100, 75, 50, 25, 10, 0 };
+    int idx = cmd_id - 501;
+    if (idx < 0 || idx > 5) return;
+    volumePct = kPct[idx];
+    g_audio_volume = volumePct / 100.0f;
+    wchar_t lbl[20];
+    if (volumePct == 0)   swprintf_s(lbl, L"Vol: Mute");
+    else if (volumePct == 100) swprintf_s(lbl, L"Volume");
+    else                       swprintf_s(lbl, L"Vol: %d%%", volumePct);
+    if (hBtnVolume) SetWindowTextW(hBtnVolume, lbl);
+}
+
 void ControllerApp::export_settings()
 {
 
-    wchar_t vport_buf[8] = {}, iport_buf[8] = {}, pass_buf[128] = {};
+    wchar_t vport_buf[8] = {}, iport_buf[8] = {}, aport_buf[8] = {}, pass_buf[128] = {};
     HWND hVp = GetDlgItem(hConnectWnd, ID_EDIT_VPORT);
     HWND hIp = GetDlgItem(hConnectWnd, ID_EDIT_IPORT);
+    HWND hAp = GetDlgItem(hConnectWnd, ID_EDIT_APORT);
     HWND hPa = GetDlgItem(hConnectWnd, ID_EDIT_PASS);
     if (hVp) GetWindowTextW(hVp, vport_buf, 8);
     if (hIp) GetWindowTextW(hIp, iport_buf, 8);
+    if (hAp) GetWindowTextW(hAp, aport_buf, 8);
     if (hPa) GetWindowTextW(hPa, pass_buf, 128);
 
     int vport = _wtoi(vport_buf);
     int iport = _wtoi(iport_buf);
+    int aport = _wtoi(aport_buf);
     if (vport < 1024 || vport > 65535) vport = 55000;
     if (iport < 1024 || iport > 65535) iport = 55001;
+    if (aport < 1024 || aport > 65535) aport = 55002;
 
     std::wstring wpass(pass_buf);
     std::string  passphrase(wpass.begin(), wpass.end());
@@ -2241,6 +2421,7 @@ void ControllerApp::export_settings()
     f << "#\n";
     f << "video_port = " << vport << "\n";
     f << "input_port = " << iport << "\n";
+    f << "audio_port = " << aport << "\n";
     f << "connection = " << conn_str << "\n";
 
     bool inc_startup = hChkStartup &&
