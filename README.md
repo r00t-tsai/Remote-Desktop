@@ -36,5 +36,5 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/2a1bee6e-d966-4a84-b1d4-9d6f2e521f3b" width="800" controls></video>
-  <p><i>Demonstration</i></p>
+  <p><i>Demonstration v1.1.2</i></p>
 </div>
