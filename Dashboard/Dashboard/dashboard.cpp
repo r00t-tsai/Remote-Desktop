@@ -1991,6 +1991,9 @@ void ControllerApp::lock_cursor()
 
     start_listeners();
 }
+static std::atomic<bool> g_hook_ctrl{ false };
+static std::atomic<bool> g_hook_shift{ false };
+static std::atomic<bool> g_hook_alt{ false };
 
 void ControllerApp::unlock_cursor()
 {
@@ -2000,6 +2003,10 @@ void ControllerApp::unlock_cursor()
         L"Click inside stream to lock cursor  |  ESC to unlock");
     ShowCursor(TRUE);
     stop_listeners();
+
+    g_hook_ctrl = false;
+    g_hook_shift = false;
+    g_hook_alt = false;
 }
 
 static bool ui_has_focus()
@@ -2017,15 +2024,21 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp)
         KBDLLHOOKSTRUCT* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         bool pressed = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
         bool released = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        DWORD vk = ks->vkCode;
+
+        if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+            g_hook_ctrl = pressed;
+        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+            g_hook_shift = pressed;
+        if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+            g_hook_alt = pressed;
 
         if (pressed || released) {
-            DWORD vk = ks->vkCode;
 
             if (vk == VK_ESCAPE && pressed) {
                 HWND hw = g_app->hSessionWnd ? g_app->hSessionWnd : g_app->hwnd;
                 PostMessageW(hw, WM_KEYDOWN, VK_ESCAPE, 0);
-                return 1;
-
+                return 1; 
             }
 
             if (vk == VK_F12 && pressed) {
@@ -2033,6 +2046,38 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp)
                 PostMessageW(hw2, WM_COMMAND,
                     MAKEWPARAM(ID_BTN_DEBUG, BN_CLICKED), 0);
                 return 1;
+            }
+
+            if (vk == VK_TAB && g_hook_alt) {
+                if (!ui_has_focus()) {
+                    g_app->input_conn->send_key(VK_MENU, pressed);
+                    g_app->input_conn->send_key(VK_TAB, pressed);
+                }
+                return 1; 
+            }
+
+            if (vk == VK_ESCAPE && g_hook_ctrl && g_hook_shift) {
+                if (!ui_has_focus()) {
+                    g_app->input_conn->send_key(VK_CONTROL, pressed);
+                    g_app->input_conn->send_key(VK_SHIFT, pressed);
+                    g_app->input_conn->send_key(VK_ESCAPE, pressed);
+                }
+                return 1;
+            }
+
+            if (vk == VK_DELETE && g_hook_ctrl && g_hook_alt) {
+                if (!ui_has_focus()) {
+                    g_app->input_conn->send_key(VK_CONTROL, pressed);
+                    g_app->input_conn->send_key(VK_MENU, pressed);
+                    g_app->input_conn->send_key(VK_DELETE, pressed);
+                }
+                return 1;
+            }
+
+            if ((vk == VK_LWIN || vk == VK_RWIN)) {
+                if (!ui_has_focus())
+                    g_app->input_conn->send_key(vk, pressed);
+                return 1; 
             }
 
             if (!ui_has_focus()) {
