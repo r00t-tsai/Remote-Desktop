@@ -849,22 +849,53 @@ static bool ShowConsentDialog(const std::string& ctrl_name) {
 
 static BSTR GetLocalIPBSTR()
 {
+
     char hostname[256] = {};
     gethostname(hostname, sizeof(hostname));
     struct addrinfo hints {}, * res = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    std::string localIP = "0.0.0.0";
-    if (getaddrinfo(hostname, nullptr, &hints, &res) == 0 && res) {
-        char ipbuf[INET_ADDRSTRLEN] = {};
-        sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(res->ai_addr);
-        inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof(ipbuf));
-        localIP = ipbuf;
+
+    std::string bestIP = "0.0.0.0";
+    int         bestRank = 99;
+
+    if (getaddrinfo(hostname, nullptr, &hints, &res) == 0) {
+        for (auto* p = res; p != nullptr; p = p->ai_next) {
+            char ipbuf[INET_ADDRSTRLEN] = {};
+            sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+            inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof(ipbuf));
+            std::string ip = ipbuf;
+
+            int rank = 99;
+            if (ip.find("127.") == 0)               continue;
+
+            else if (ip.find("192.168.") == 0)           rank = 0;
+
+            else if (ip.find("10.") == 0)           rank = 1;
+
+            else if (ip.find("172.") == 0) {
+
+                int second = 0;
+                try { second = std::stoi(ip.substr(4, ip.find('.', 4) - 4)); }
+                catch (...) {}
+                rank = (second >= 16 && second <= 31) ? 2 : 10;
+
+            }
+            else if (ip.find("169.254.") == 0)           rank = 20;
+
+            else if (ip.find("100.") == 0)           rank = 15;
+
+            else                                         rank = 10;
+
+            if (rank < bestRank) { bestRank = rank; bestIP = ip; }
+        }
         freeaddrinfo(res);
     }
-    int wlen = MultiByteToWideChar(CP_ACP, 0, localIP.c_str(), -1, nullptr, 0);
+
+    Log("HOST: Selected local IP = " + bestIP + "\n");
+    int wlen = MultiByteToWideChar(CP_ACP, 0, bestIP.c_str(), -1, nullptr, 0);
     std::wstring wip(wlen, L'\0');
-    MultiByteToWideChar(CP_ACP, 0, localIP.c_str(), -1, &wip[0], wlen);
+    MultiByteToWideChar(CP_ACP, 0, bestIP.c_str(), -1, &wip[0], wlen);
     return SysAllocString(wip.c_str());
 }
 
@@ -909,7 +940,88 @@ static void UPnPRemoveMapping(IStaticPortMappingCollection* pColl, int port)
     SysFreeString(bProto);
 }
 
-static std::string UPnPOpenPorts(int video_port, int input_port)
+static void EnsureFirewallRules(int vport, int iport, int aport)
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    wchar_t cmd[1024] = {};
+    swprintf_s(cmd,
+        L"advfirewall firewall add rule"
+        L" name=\"RemoteDesktopHost\""
+        L" dir=in action=allow protocol=TCP"
+        L" localport=%d,%d,%d"
+        L" program=\"%s\""
+        L" enable=yes",
+        vport, iport, aport, exePath);
+
+    HINSTANCE res = ShellExecuteW(NULL, L"runas", L"netsh.exe", cmd, NULL, SW_HIDE);
+    if ((INT_PTR)res > 32)
+        Log("HOST: Firewall rule added/updated for ports "
+            + std::to_string(vport) + ", "
+            + std::to_string(iport) + ", "
+            + std::to_string(aport) + "\n");
+    else
+        Log("HOST: Firewall rule setup skipped or failed (UAC denied?)\n");
+}
+
+static void CheckForDoubleNAT(IStaticPortMappingCollection* pColl, int probe_port)
+{
+
+    IStaticPortMapping* pMap = nullptr;
+    BSTR bProto = SysAllocString(L"TCP");
+    HRESULT hr = pColl->get_Item((long)probe_port, bProto, &pMap);
+    SysFreeString(bProto);
+    if (FAILED(hr) || !pMap) return;
+
+    BSTR bExtIP = nullptr;
+    hr = pMap->get_ExternalIPAddress(&bExtIP);
+    pMap->Release();
+    if (FAILED(hr) || !bExtIP) return;
+
+    char extIPBuf[64] = {};
+    WideCharToMultiByte(CP_ACP, 0, bExtIP, -1, extIPBuf, sizeof(extIPBuf), NULL, NULL);
+    SysFreeString(bExtIP);
+    std::string extIP = extIPBuf;
+    Log("HOST: Router WAN IP reported by IGD = " + extIP + "\n");
+
+    bool isCGNAT = (extIP.find("100.") == 0);
+    bool isPrivate10 = (extIP.find("10.") == 0);
+    bool isPrivate172 = false;
+    if (extIP.find("172.") == 0) {
+        int second = 0;
+        try { second = std::stoi(extIP.substr(4, extIP.find('.', 4) - 4)); }
+        catch (...) {}
+        isPrivate172 = (second >= 16 && second <= 31);
+    }
+    bool isPrivate192 = (extIP.find("192.168.") == 0);
+
+    if (isCGNAT || isPrivate10 || isPrivate172 || isPrivate192) {
+        std::wstring reason = isCGNAT
+            ? L"Your ISP is using CGNAT (Carrier-Grade NAT).\n"
+            L"The external IP reported by your router (" + std::wstring(extIPBuf, extIPBuf + strlen(extIPBuf)) + L")\n"
+            L"is itself inside a private range — your router is behind another NAT."
+            : L"Double-NAT detected.\n"
+            L"Your router's WAN IP (" + std::wstring(extIPBuf, extIPBuf + strlen(extIPBuf)) + L")\n"
+            L"is a private address, meaning there is another router between you and the internet.";
+
+        std::wstring msg = reason +
+            L"WAN clients will not be able to connect.\n\n"
+            L"Solutions:\n"
+            L"  \x2022  Ask your ISP for a public static IP\n"
+            L"  \x2022  Use a VPN tunnel (WireGuard, ZeroTier, Tailscale)\n"
+            L"  \x2022  Use a relay/TURN server\n\n"
+            L"LAN connections are unaffected.";
+
+        MessageBoxW(NULL, msg.c_str(),
+            L"Remote Desktop Host \x2014 Double-NAT / CGNAT Warning",
+            MB_OK | MB_ICONWARNING | MB_TOPMOST);
+
+        Log("HOST: WARNING — double-NAT/CGNAT: WAN IP=" + extIP + "\n");
+    }
+}
+
+static void UPnPOpenPorts(int video_port, int input_port)
 {
     g_upnp_mapped = false;
 
@@ -918,30 +1030,101 @@ static std::string UPnPOpenPorts(int video_port, int input_port)
     IUPnPNAT* pNAT = nullptr;
     HRESULT hr = CoCreateInstance(__uuidof(UPnPNAT), nullptr,
         CLSCTX_ALL, __uuidof(IUPnPNAT), (void**)&pNAT);
-    if (FAILED(hr) || !pNAT)
-        return "UPnP: CoCreateInstance failed (NAT COM not available)";
+    if (FAILED(hr) || !pNAT) {
+        Log("UPnP: CoCreateInstance failed (NAT COM not available)\n");
+        MessageBoxW(NULL,
+            L"UPnP is not available on this system.\n\n"
+            L"The Windows UPnP service (UPnPNAT) could not be started.\n\n"
+            L"Possible fixes:\n"
+            L"  \x2022  Enable \"SSDP Discovery\" & \"UPnP Device Host\"\n"
+            L"  \x2022  Restart the host machine\n\n"
+            L"WAN connections will not work.\n"
+            L"LAN connections are unaffected.",
+            L"Remote Desktop Host \x2014 UPnP Unavailable",
+            MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
 
     IStaticPortMappingCollection* pColl = nullptr;
     hr = pNAT->get_StaticPortMappingCollection(&pColl);
     pNAT->Release();
-    if (FAILED(hr) || !pColl)
-        return "UPnP: No IGD found on this network (router may not support UPnP)";
+    if (FAILED(hr) || !pColl) {
+        Log("UPnP: No IGD found on this network\n");
+        MessageBoxW(NULL,
+            L"No UPnP-capable router (IGD) was found on this network.\n\n"
+            L"Possible causes:\n"
+            L"  \x2022  Your router has UPnP disabled.\n"
+            L"  \x2022  You are using a switch with no UPnP-capable gateway\n"
+            L"  \x2022  A firewall is blocking SSDP discovery (UDP port 1900)\n\n"
+            L"WAN connections will not work.\n"
+            L"LAN connections are unaffected.",
+            L"Remote Desktop Host \x2014 No UPnP Router Found",
+            MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
 
     g_upnp_vid_desc = "RDHost-Video-" + std::to_string(video_port);
     g_upnp_inp_desc = "RDHost-Input-" + std::to_string(input_port);
 
     bool ok_vid = UPnPAddMapping(pColl, video_port, g_upnp_vid_desc.c_str());
     bool ok_inp = UPnPAddMapping(pColl, input_port, g_upnp_inp_desc.c_str());
-    pColl->Release();
 
     if (ok_vid && ok_inp) {
         g_upnp_mapped = true;
-        return "UPnP: Ports " + std::to_string(video_port) +
-            " & " + std::to_string(input_port) + " forwarded via IGD";
+        Log("UPnP: Ports " + std::to_string(video_port) + " & "
+            + std::to_string(input_port) + " forwarded via IGD\n");
+
+        wchar_t successMsg[512];
+        swprintf_s(successMsg,
+            L"UPnP port forwarding is active.\n\n"
+            L"  \x2022  Video port:  %d\n"
+            L"  \x2022  Input port:  %d\n\n"
+            L"Remote clients can now connect over the internet\n"
+            L"(provided your router's WAN IP is publicly reachable).",
+            video_port, input_port);
+        MessageBoxW(NULL, successMsg,
+            L"Remote Desktop Host \x2014 UPnP Active",
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+
+        CheckForDoubleNAT(pColl, video_port);
+        pColl->Release();
+        return;
     }
-    if (ok_vid || ok_inp)
-        return "UPnP: Partial mapping (one port may be blocked by router)";
-    return "UPnP: Mapping failed (check router UPnP settings)";
+
+    pColl->Release();
+
+    if (ok_vid || ok_inp) {
+        int failed_port = ok_vid ? input_port : video_port;
+        wchar_t msg[512];
+        swprintf_s(msg,
+            L"UPnP partial mapping: only one of the two ports was forwarded.\n\n"
+            L"  \x2022  Video port %d:  %s\n"
+            L"  \x2022  Input port %d:  %s\n\n"
+            L"Port %d could not be mapped — your router may have rejected it.\n\n"
+            L"Try forwarding port %d manually in your router settings.\n"
+            L"Remote connections over WAN may be unreliable.",
+            video_port, ok_vid ? L"OK" : L"FAILED",
+            input_port, ok_inp ? L"OK" : L"FAILED",
+            failed_port, failed_port);
+        Log("UPnP: Partial mapping — port " + std::to_string(failed_port) + " failed\n");
+        MessageBoxW(NULL, msg,
+            L"Remote Desktop Host \x2014 UPnP Partial Mapping",
+            MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
+
+    Log("UPnP: Mapping failed for both ports\n");
+    MessageBoxW(NULL,
+        L"UPnP port forwarding failed for both ports.\n\n"
+        L"Your router found but rejected the mapping requests.\n\n"
+        L"Possible causes:\n"
+        L"  \x2022  The router's UPnP implementation is restricted or broken\n"
+        L"  \x2022  Another device has already claimed these ports\n"
+        L"  \x2022  The router firmware has a UPnP bug\n\n"
+        L"Try forwarding the ports manually in your router settings,\n"
+        L"or use a VPN/tunnel solution (ZeroTier, Tailscale, WireGuard).",
+        L"Remote Desktop Host \x2014 UPnP Mapping Failed",
+        MB_OK | MB_ICONERROR | MB_TOPMOST);
 }
 
 static void UPnPClosePorts(int video_port, int input_port)
@@ -1080,6 +1263,17 @@ static void HandleStartupRegistration()
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\RemoteDesktopHost_SingleInstance");
+    if (hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(NULL,
+            L"Remote Desktop Host is already running.\n\n"
+            L"Only one instance may run at a time.",
+            L"Remote Desktop Host - Already Running",
+            MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        if (hMutex) ReleaseMutex(hMutex), CloseHandle(hMutex);
+        return 1;
+    }
+
     LogInit();
 
     HostConfig cfg;
@@ -1121,6 +1315,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     GdiplusStartupInput gsi;
     GdiplusStartup(&g_gdiplus_token, &gsi, NULL);
     FindJpegClsid(&g_jpeg_clsid);
+    EnsureFirewallRules(cfg.video_port, cfg.input_port, cfg.audio_port);
 
     auto make_listener = [](int port) -> SOCKET {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1138,27 +1333,78 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         return s;
         };
 
-    SOCKET vid_listen = make_listener(cfg.video_port);
-    SOCKET inp_listen = make_listener(cfg.input_port);
+    const int PORT_HUNT_LIMIT = 20;
+    SOCKET vid_listen = INVALID_SOCKET;
+    {
+        int configured = cfg.video_port;
+        for (int attempt = 0; attempt < PORT_HUNT_LIMIT; ++attempt) {
+            vid_listen = make_listener(cfg.video_port);
+            if (vid_listen != INVALID_SOCKET) break;
+            cfg.video_port++;
+        }
+        if (vid_listen == INVALID_SOCKET) {
+            MessageBoxW(NULL,
+                L"Could not bind the video port after 20 attempts.\n\n"
+                L"All ports in range are in use by other applications.",
+                L"Remote Desktop Host \x2014 Network Error",
+                MB_OK | MB_ICONERROR | MB_TOPMOST);
+            WSACleanup(); LogShutdown(); return 1;
+        }
+        if (cfg.video_port != configured) {
+            wchar_t warn[256];
+            swprintf_s(warn,
+                L"Video port %d was already in use.\n\n"
+                L"The host will listen on port %d instead.\n\n"
+                L"Make sure your controller connects to the new port.",
+                configured, cfg.video_port);
+            MessageBoxW(NULL, warn,
+                L"Remote Desktop Host \x2014 Port Changed",
+                MB_OK | MB_ICONWARNING | MB_TOPMOST);
+            Log("HOST: video_port changed from " + std::to_string(configured)
+                + " to " + std::to_string(cfg.video_port) + " (original was in use)\n");
+        }
+    }
 
-    if (vid_listen == INVALID_SOCKET || inp_listen == INVALID_SOCKET) {
-        MessageBoxW(NULL,
-            L"Failed to bind listening sockets.\n\n"
-            L"Possible causes:\n"
-            L"  - Another instance is already running\n"
-            L"  - The port is in use by another application\n"
-            L"  - Windows Firewall is blocking the port",
-            L"Remote Desktop Host - Network Error",
-            MB_OK | MB_ICONERROR | MB_TOPMOST);
-        WSACleanup(); LogShutdown(); return 1;
+    if (cfg.input_port == cfg.video_port) cfg.input_port = cfg.video_port + 1;
+
+    SOCKET inp_listen = INVALID_SOCKET;
+    {
+        int configured = cfg.input_port;
+        for (int attempt = 0; attempt < PORT_HUNT_LIMIT; ++attempt) {
+            if (cfg.input_port == cfg.video_port) { cfg.input_port++; continue; }
+            inp_listen = make_listener(cfg.input_port);
+            if (inp_listen != INVALID_SOCKET) break;
+            cfg.input_port++;
+        }
+        if (inp_listen == INVALID_SOCKET) {
+            closesocket(vid_listen);
+            MessageBoxW(NULL,
+                L"Could not bind the input port after 20 attempts.\n\n"
+                L"All ports in range are in use by other applications.",
+                L"Remote Desktop Host \x2014 Network Error",
+                MB_OK | MB_ICONERROR | MB_TOPMOST);
+            WSACleanup(); LogShutdown(); return 1;
+        }
+        if (cfg.input_port != configured) {
+            wchar_t warn[256];
+            swprintf_s(warn,
+                L"Input port %d was already in use.\n\n"
+                L"The host will listen on port %d instead.\n\n"
+                L"Make sure your controller connects to the new port.",
+                configured, cfg.input_port);
+            MessageBoxW(NULL, warn,
+                L"Remote Desktop Host \x2014 Port Changed",
+                MB_OK | MB_ICONWARNING | MB_TOPMOST);
+            Log("HOST: input_port changed from " + std::to_string(configured)
+                + " to " + std::to_string(cfg.input_port) + " (original was in use)\n");
+        }
     }
 
     Log("HOST: Listening on video=" + std::to_string(cfg.video_port)
         + " input=" + std::to_string(cfg.input_port) + "\n");
 
     if (cfg.wan_mode) {
-        std::string upnpResult = UPnPOpenPorts(cfg.video_port, cfg.input_port);
-        Log("HOST: " + upnpResult + "\n");
+        UPnPOpenPorts(cfg.video_port, cfg.input_port);
     }
     else {
         Log("HOST: LAN mode — skipping UPnP port forwarding\n");
@@ -1197,5 +1443,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     WSACleanup();
     Log("HOST: Shut down cleanly\n");
     LogShutdown();
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
     return 0;
 }
