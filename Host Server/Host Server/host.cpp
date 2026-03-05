@@ -381,7 +381,41 @@ static bool FindJpegClsid(CLSID* out) {
     return false;
 }
 
+static HDESK SwitchToInputDesktop()
+{
+    HDESK hCurDesk = GetThreadDesktop(GetCurrentThreadId());
+    HDESK hInputDesk = OpenInputDesktop(0, FALSE,
+        DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW |
+        DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL |
+        DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS |
+        DESKTOP_SWITCHDESKTOP);
+
+    if (!hInputDesk)
+        return NULL;
+
+    DWORD nameLen1 = 0, nameLen2 = 0;
+    GetUserObjectInformationW(hCurDesk, UOI_NAME, NULL, 0, &nameLen1);
+    GetUserObjectInformationW(hInputDesk, UOI_NAME, NULL, 0, &nameLen2);
+    std::wstring curName(nameLen1 / sizeof(wchar_t) + 1, L'\0');
+    std::wstring inpName(nameLen2 / sizeof(wchar_t) + 1, L'\0');
+    GetUserObjectInformationW(hCurDesk, UOI_NAME, &curName[0],
+        (DWORD)(curName.size() * sizeof(wchar_t)), &nameLen1);
+    GetUserObjectInformationW(hInputDesk, UOI_NAME, &inpName[0],
+        (DWORD)(inpName.size() * sizeof(wchar_t)), &nameLen2);
+
+    if (curName == inpName) {
+        CloseDesktop(hInputDesk);
+        return NULL;
+    }
+
+    SetThreadDesktop(hInputDesk);
+    CloseDesktop(hInputDesk);
+    return hCurDesk;
+}
+
 static std::vector<uint8_t> CaptureScreenJpeg() {
+    HDESK hPrevDesk = SwitchToInputDesktop();
+
     HDC hdcScr = GetDC(NULL);
     int sw = GetDeviceCaps(hdcScr, DESKTOPHORZRES);
     int sh = GetDeviceCaps(hdcScr, DESKTOPVERTRES);
@@ -403,6 +437,10 @@ static std::vector<uint8_t> CaptureScreenJpeg() {
     SelectObject(hdcMem, hOldF); DeleteObject(hf);
 
     SelectObject(hdcMem, hOld); DeleteDC(hdcMem); ReleaseDC(NULL, hdcScr);
+
+    if (hPrevDesk) {
+        SetThreadDesktop(hPrevDesk);
+    }
 
     Bitmap bmp(hbmp, NULL);
     EncoderParameters ep; memset(&ep, 0, sizeof(ep));
@@ -624,6 +662,17 @@ static void HeartbeatThread() {
 
 static void InputThread() {
     Log("INPUT: Listening\n");
+    typedef VOID(WINAPI* PFN_SendSAS)(BOOL asUser);
+    static PFN_SendSAS pfnSendSAS = nullptr;
+    if (!pfnSendSAS) {
+        HMODULE hSas = LoadLibraryW(L"sas.dll");
+        if (hSas) pfnSendSAS = (PFN_SendSAS)GetProcAddress(hSas, "SendSAS");
+    }
+
+    bool ctrl_down = false;
+    bool alt_down = false;
+    bool del_pending = false;
+
     HDC tmp = GetDC(NULL);
     int phys_w = GetDeviceCaps(tmp, DESKTOPHORZRES);
     int phys_h = GetDeviceCaps(tmp, DESKTOPVERTRES);
@@ -681,6 +730,34 @@ static void InputThread() {
             uint32_t vkn = 0; memcpy(&vkn, pkt.data.data(), 4);
             uint8_t pressed = pkt.data[4];
             WORD vk = (WORD)ntohl(vkn);
+
+            if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+                ctrl_down = (pressed != 0);
+            if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+                alt_down = (pressed != 0);
+
+            if (vk == VK_DELETE && pressed && ctrl_down && alt_down) {
+                if (pfnSendSAS) {
+                    pfnSendSAS(FALSE);
+                    Log("INPUT: SendSAS triggered\n");
+                }
+                else {
+
+                    INPUT sas[3]; memset(sas, 0, sizeof(sas));
+                    sas[0].type = INPUT_KEYBOARD; sas[0].ki.wVk = VK_CONTROL;
+                    sas[1].type = INPUT_KEYBOARD; sas[1].ki.wVk = VK_MENU;
+                    sas[2].type = INPUT_KEYBOARD; sas[2].ki.wVk = VK_DELETE;
+                    sas[2].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+                    SendInput(3, sas, sizeof(INPUT));
+                    sas[0].ki.dwFlags = KEYEVENTF_KEYUP;
+                    sas[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    sas[2].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+                    SendInput(3, sas, sizeof(INPUT));
+                    Log("INPUT: Ctrl+Alt+Del fallback injected\n");
+                }
+                continue;  
+            }
+
             WORD sc = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
             static const WORD ext[] = {
                 VK_RMENU, VK_RCONTROL, VK_RSHIFT,
