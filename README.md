@@ -6,11 +6,13 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 * Listens for incoming connections on TCP ports 55000 (video) and 55001 (input).
 * Streams the desktop using GDI+ JPEG compression.
 * Injects received mouse and keyboard commands into the system.
+* Captures audio stream directly from the default playback device.
 
 ### Dashboard Client
 * GUI to enter the target Host IP and your connection name.
 * Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the client.
 * Exports Host configuration settings.
+* Takes the audio data streamed from the Host and plays it through the speakers using Windows multimedia APIs.
 
 ## Building
 ### Compiler: Microsoft Visual C++ (MSVC) is highly recommended.
