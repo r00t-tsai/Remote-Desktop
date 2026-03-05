@@ -1,5 +1,5 @@
 # Simple C++ Remote Desktop
-A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen, listen to audio playbacks, and control the mouse and keyboard of another machine over WAN/LAN.
+A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen, listen to audio playbacks, and control the mouse and keyboard of another machine over WAN/LAN. This is one of my side projects back then that I forgot to upload.
 
 ## Components
 ### Host
