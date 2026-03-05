@@ -23,6 +23,10 @@
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cmath>
+#include <fstream>
+#include <commdlg.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -32,6 +36,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 static constexpr uint8_t PKT_HANDSHAKE = 0x01;
 static constexpr uint8_t PKT_HANDSHAKE_ACK = 0x02;
@@ -43,21 +48,148 @@ static constexpr uint8_t PKT_MOUSE_EVENT = 0x10;
 static constexpr uint8_t PKT_KEY_EVENT = 0x11;
 static constexpr uint8_t PKT_DISCONNECT = 0xFF;
 
-static constexpr int VIDEO_PORT = 55000;
-static constexpr int INPUT_PORT = 55001;
+static int VIDEO_PORT = 55000;
+static int INPUT_PORT = 55001;
+
+namespace AES128 {
+    static const uint8_t SBOX[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+    };
+    static const uint8_t RCON[11] = { 0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+    static uint8_t gmul(uint8_t a, uint8_t b) {
+        uint8_t r = 0;
+        for (int i = 0; i < 8; i++) {
+            if (b & 1) r ^= a;
+            bool hi = (a & 0x80) != 0;
+            a <<= 1;
+            if (hi) a ^= 0x1b;
+            b >>= 1;
+        }
+        return r;
+    }
+    struct AESCtx { uint8_t rk[176]; };
+    static void KeyExpansion(const uint8_t* key, uint8_t* rk) {
+        memcpy(rk, key, 16);
+        for (int i = 4; i < 44; i++) {
+            uint8_t tmp[4]; memcpy(tmp, &rk[(i - 1) * 4], 4);
+            if (i % 4 == 0) {
+                uint8_t t = tmp[0];
+                tmp[0] = SBOX[tmp[1]] ^ RCON[i / 4];
+                tmp[1] = SBOX[tmp[2]];
+                tmp[2] = SBOX[tmp[3]];
+                tmp[3] = SBOX[t];
+            }
+            for (int j = 0; j < 4; j++)
+                rk[i * 4 + j] = rk[(i - 4) * 4 + j] ^ tmp[j];
+        }
+    }
+    static void AddRoundKey(uint8_t s[16], const uint8_t* rk) { for (int i = 0; i < 16; i++) s[i] ^= rk[i]; }
+    static void SubBytes(uint8_t s[16]) { for (int i = 0; i < 16; i++) s[i] = SBOX[s[i]]; }
+    static void ShiftRows(uint8_t s[16]) {
+        uint8_t t;
+        t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+        t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+    }
+    static void MixColumns(uint8_t s[16]) {
+        for (int c = 0; c < 4; c++) {
+            uint8_t* col = s + c * 4; uint8_t a = col[0], b = col[1], cc = col[2], d = col[3];
+            col[0] = gmul(a, 2) ^ gmul(b, 3) ^ cc ^ d; col[1] = a ^ gmul(b, 2) ^ gmul(cc, 3) ^ d;
+            col[2] = a ^ b ^ gmul(cc, 2) ^ gmul(d, 3); col[3] = gmul(a, 3) ^ b ^ cc ^ gmul(d, 2);
+        }
+    }
+    static void AES_EncryptBlock(const uint8_t* rk, const uint8_t in[16], uint8_t out[16]) {
+        uint8_t s[16]; memcpy(s, in, 16);
+        AddRoundKey(s, rk);
+        for (int r = 1; r < 10; r++) { SubBytes(s); ShiftRows(s); MixColumns(s); AddRoundKey(s, rk + r * 16); }
+        SubBytes(s); ShiftRows(s); AddRoundKey(s, rk + 160);
+        memcpy(out, s, 16);
+    }
+    static void CTR_XOR(const AESCtx& ctx, uint64_t counter, uint8_t* buf, size_t len) {
+        uint8_t ctr_block[16] = {};
+        size_t offset = 0;
+        while (offset < len) {
+            uint64_t ctr_be = 0;
+            for (int i = 0; i < 8; i++) ctr_be = (ctr_be << 8) | ((counter >> (56 - i * 8)) & 0xFF);
+            memset(ctr_block, 0, 8); memcpy(ctr_block + 8, &ctr_be, 8);
+            uint8_t ks[16]; AES_EncryptBlock(ctx.rk, ctr_block, ks);
+            size_t chunk = (len - offset < 16) ? (len - offset) : 16;
+            for (size_t i = 0; i < chunk; i++) buf[offset + i] ^= ks[i];
+            offset += chunk; counter++;
+        }
+    }
+    static void DeriveKey(const std::string& passphrase, uint8_t key[16]) {
+        memset(key, 0x5A, 16);
+        for (size_t i = 0; i < passphrase.size(); i++)
+            key[i % 16] ^= (uint8_t)passphrase[i] ^ (uint8_t)(i * 0x9B);
+        for (int r = 0; r < 4096; r++)
+            for (int b = 0; b < 16; b++)
+                key[b] = SBOX[key[b] ^ (uint8_t)r ^ key[(b + 7) % 16]];
+    }
+}
+
+static AES128::AESCtx   g_aes_ctx;
+static bool             g_aes_enabled = false;
+static std::atomic<uint64_t> g_aes_inp_send_ctr{ 0 };
+
+static std::atomic<uint64_t> g_aes_vid_recv_ctr{ 0 };
+
+static void CryptVideoRecv(std::vector<uint8_t>& buf) {
+    if (!g_aes_enabled || buf.empty()) return;
+    uint64_t ctr = g_aes_vid_recv_ctr.fetch_add(1);
+    AES128::CTR_XOR(g_aes_ctx, ctr, buf.data(), buf.size());
+}
+static void CryptInputSend(std::vector<uint8_t>& buf) {
+    if (!g_aes_enabled || buf.empty()) return;
+    uint64_t ctr = g_aes_inp_send_ctr.fetch_add(1);
+    AES128::CTR_XOR(g_aes_ctx, ctr, buf.data(), buf.size());
+}
 
 static constexpr int ID_BTN_CONNECT = 101;
 static constexpr int ID_BTN_DISCONNECT = 102;
 static constexpr int ID_BTN_DEBUG = 103;
 static constexpr int ID_EDIT_IP = 104;
 static constexpr int ID_EDIT_NAME = 105;
+
+static constexpr int ID_EDIT_VPORT = 106;
+static constexpr int ID_EDIT_IPORT = 107;
+static constexpr int ID_EDIT_PASS = 108;
+static constexpr int ID_CHK_INTERNET = 109;
+static constexpr int ID_CHK_DEBUG = 110;
+
+static constexpr int ID_BTN_EXPORT = 111;
+
+static constexpr int ID_CHK_STARTUP = 112;
+
+static constexpr int ID_EDIT_IP_GHOST = 113;
+
 static constexpr UINT WM_APP_STATUS = WM_APP + 1;
 static constexpr UINT WM_APP_FRAME = WM_APP + 2;
 static constexpr UINT WM_APP_DISCONN = WM_APP + 3;
 static constexpr UINT WM_APP_CONNECTED = WM_APP + 4;
 static constexpr UINT WM_APP_SHOW_SESSION = WM_APP + 5;
-
 static constexpr UINT WM_APP_SHOW_CONNECT = WM_APP + 6;
+static constexpr UINT WM_APP_CONN_CANCEL = WM_APP + 7;
+
+static constexpr int ID_OVERLAY_CANCEL = 200;
+static constexpr int ID_OVERLAY_TIMER = 1;
+
+static constexpr int ID_OVERLAY_LATE_TIMER = 2;
 
 static inline uint32_t hton32(uint32_t v) { return htonl(v); }
 static inline uint32_t ntoh32(uint32_t v) { return ntohl(v); }
@@ -186,6 +318,8 @@ public:
 
     explicit InputConnection(const std::string& h) : host(h) {}
 
+    int input_port = 55001;
+
     bool connect(double timeout_sec = 60.0)
     {
         auto deadline = std::chrono::steady_clock::now() +
@@ -199,8 +333,20 @@ public:
 
             sockaddr_in addr{};
             addr.sin_family = AF_INET;
-            addr.sin_port = htons(INPUT_PORT);
-            inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+            addr.sin_port = htons((u_short)input_port);
+
+            struct addrinfo hints {}, * res = nullptr;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            char portstr[8]; sprintf_s(portstr, "%d", input_port);
+            if (getaddrinfo(host.c_str(), portstr, &hints, &res) == 0 && res) {
+                addr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
+                addr.sin_port = htons((u_short)input_port);
+                freeaddrinfo(res);
+            }
+            else {
+                inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+            }
 
             if (::connect(s, (sockaddr*)&addr, sizeof(addr)) == 0) {
 
@@ -232,7 +378,10 @@ public:
         strncpy(bt4, button, 4);
         memcpy(payload + 4, ev4, 4);
         memcpy(payload + 8, bt4, 4);
-        send_packet(sock, PKT_MOUSE_EVENT, payload, 12);
+
+        std::vector<uint8_t> enc_m(payload, payload + 12);
+        CryptInputSend(enc_m);
+        send_packet(sock, PKT_MOUSE_EVENT, enc_m.data(), 12);
     }
 
     void send_key(uint32_t vk, bool pressed)
@@ -242,7 +391,10 @@ public:
         uint32_t nvk = hton32(vk);
         memcpy(payload, &nvk, 4);
         payload[4] = pressed ? 1 : 0;
-        send_packet(sock, PKT_KEY_EVENT, payload, 5);
+
+        std::vector<uint8_t> enc_k(payload, payload + 5);
+        CryptInputSend(enc_k);
+        send_packet(sock, PKT_KEY_EVENT, enc_k.data(), 5);
     }
 
     void disconnect()
@@ -278,19 +430,30 @@ public:
         : host(h), controller_name(name) {
     }
 
+    int video_port = 55000;
+
     std::pair<bool, std::string> connect_video()
     {
         SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) return { false,"socket() failed" };
 
         DWORD tv = 10000;
-
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(VIDEO_PORT);
-        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        addr.sin_port = htons((u_short)video_port);
+        struct addrinfo hints {}, * res = nullptr;
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        char portstr[8]; sprintf_s(portstr, "%d", video_port);
+        if (getaddrinfo(host.c_str(), portstr, &hints, &res) == 0 && res) {
+            addr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
+            addr.sin_port = htons((u_short)video_port);
+            freeaddrinfo(res);
+        }
+        else {
+            inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        }
 
         if (::connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
             closesocket(s);
@@ -338,6 +501,8 @@ public:
             if (!recv_packet(sock, ptype, pdata)) break;
 
             if (ptype == PKT_VIDEO_FRAME && pdata.size() > 8) {
+
+                CryptVideoRecv(pdata);
                 uint32_t cx_n, cy_n;
                 memcpy(&cx_n, pdata.data() + 0, 4); cx_n = ntoh32(cx_n);
                 memcpy(&cy_n, pdata.data() + 4, 4); cy_n = ntoh32(cy_n);
@@ -392,6 +557,30 @@ public:
 
     HWND hDebugWin = NULL;
     bool debugVisible = false;
+
+    HWND  hLoadingWnd = NULL;
+
+    HWND  hLoadingLabel = NULL;
+
+    HWND  hLoadingLate = NULL;
+
+    HWND  hLoadingCancel = NULL;
+
+    int   spinAngle = 0;
+
+    std::atomic<bool> g_connect_cancelled{ false };
+
+    void show_loading_overlay();
+    void hide_loading_overlay();
+    void cancel_connect();
+    void tick_spinner();
+    void show_late_label();
+    void export_settings();
+    void update_ip_placeholder();
+
+    HWND hChkStartup = NULL;
+
+    HWND hIpGhost = NULL;
 
     std::unique_ptr<VideoConnection> video_conn;
     std::unique_ptr<InputConnection> input_conn;
@@ -719,8 +908,35 @@ LRESULT ControllerApp::handle_message(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case ID_BTN_CONNECT:    on_connect();       break;
         case ID_BTN_DISCONNECT: on_disconnect_btn(); break;
         case ID_BTN_DEBUG:      toggle_debug();      break;
+        case ID_OVERLAY_CANCEL: cancel_connect();    break;
+        case ID_BTN_EXPORT:     export_settings();  break;
+        case ID_CHK_INTERNET:
+
+            update_ip_placeholder();
+            break;
+        case ID_EDIT_IP:
+
+            if (HIWORD(wp) == EN_CHANGE) update_ip_placeholder();
+            break;
         }
         return 0;
+
+    case WM_APP_CONN_CANCEL:
+        hide_loading_overlay();
+        EnableWindow(hBtnConnect, TRUE);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == ID_OVERLAY_TIMER) {
+            tick_spinner();
+            return 0;
+        }
+        if (wp == ID_OVERLAY_LATE_TIMER) {
+            KillTimer(h, ID_OVERLAY_LATE_TIMER);
+            show_late_label();
+            return 0;
+        }
+        break;
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -751,10 +967,9 @@ LRESULT ControllerApp::handle_message(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_APP_CONNECTED:
-
+        hide_loading_overlay();
         ShowWindow(hConnectWnd, SW_HIDE);
         create_session_window();
-
         hwnd = hSessionWnd;
         return 0;
 
@@ -792,9 +1007,6 @@ bool ControllerApp::init(HINSTANCE hInst)
 
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-    //
-    // Register classes
-    //
     WNDCLASSEXW wcc{};
     wcc.cbSize = sizeof(wcc);
     wcc.lpfnWndProc = CanvasProcStatic;
@@ -821,125 +1033,347 @@ bool ControllerApp::init(HINSTANCE hInst)
     wcSess.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassExW(&wcSess);
 
-    //
-    // Desired CLIENT size (no status bar anymore)
-    //
-    int clientW = 360;
-    int clientH = 170;
+    const int CW = 420;
+
+    const int CH = 442;
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = 0;
 
-    RECT rc = { 0, 0, clientW, clientH };
+    RECT rc = { 0, 0, CW, CH };
     AdjustWindowRectEx(&rc, style, FALSE, exStyle);
 
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
-
     int scrW = GetSystemMetrics(SM_CXSCREEN);
     int scrH = GetSystemMetrics(SM_CYSCREEN);
 
-    int posX = (scrW - winW) / 2;
-    int posY = (scrH - winH) / 2;
-
-    //
-    // Create main connect window
-    //
     hConnectWnd = CreateWindowExW(
-        exStyle,
-        L"RDConnectCls",
+        exStyle, L"RDConnectCls",
         L"Remote Desktop Controller",
         style | WS_VISIBLE,
-        posX, posY,
+        (scrW - winW) / 2, (scrH - winH) / 2,
         winW, winH,
         NULL, NULL, hInst, NULL);
 
-    if (!hConnectWnd)
-        return false;
-
+    if (!hConnectWnd) return false;
     hwnd = hConnectWnd;
 
-    //
-    // Helper lambdas
-    //
-    auto lbl = [&](const wchar_t* text, int x, int y, int w, int h)
-        {
-            HWND hw = CreateWindowW(
-                L"STATIC", text,
-                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                x, y, w, h,
-                hConnectWnd, NULL, hInst, NULL);
+    HFONT hfNormal = hFont;
 
-            SendMessage(hw, WM_SETFONT, (WPARAM)hFont, TRUE);
+    HFONT hfBold = CreateFontW(
+        -MulDiv(9, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+        0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (!hfBold) hfBold = hfNormal;
+
+    auto lbl_np = [&](const wchar_t* text, int x, int y, int w, int h,
+        bool bold = false)
+        {
+            HWND hw = CreateWindowW(L"STATIC", text,
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                x, y, w, h, hConnectWnd, NULL, hInst, NULL);
+            SendMessage(hw, WM_SETFONT, (WPARAM)(bold ? hfBold : hfNormal), TRUE);
+            return hw;
+        };
+    auto edt = [&](const wchar_t* def, int id, int x, int y, int w, int h,
+        DWORD extra = 0)
+        {
+            HWND hw = CreateWindowW(L"EDIT", def,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | extra,
+                x, y, w, h, hConnectWnd, (HMENU)(INT_PTR)id, hInst, NULL);
+            SendMessage(hw, WM_SETFONT, (WPARAM)hfNormal, TRUE);
             return hw;
         };
 
-    auto edt = [&](const wchar_t* def, int id, int x, int y, int w, int h)
+    auto chk = [&](const wchar_t* text, int id, int x, int y, int w, int h)
         {
-            HWND hw = CreateWindowW(
-                L"EDIT", def,
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                x, y, w, h,
-                hConnectWnd, (HMENU)(INT_PTR)id, hInst, NULL);
-
-            SendMessage(hw, WM_SETFONT, (WPARAM)hFont, TRUE);
+            HWND hw = CreateWindowW(L"BUTTON", text,
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_NOTIFY,
+                x, y, w, h, hConnectWnd, (HMENU)(INT_PTR)id, hInst, NULL);
+            SendMessage(hw, WM_SETFONT, (WPARAM)hfNormal, TRUE);
             return hw;
         };
 
-    auto btn = [&](const wchar_t* text, int id, int x, int y, int w, int h)
-        {
-            HWND hw = CreateWindowW(
-                L"BUTTON", text,
-                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                x, y, w, h,
-                hConnectWnd, (HMENU)(INT_PTR)id, hInst, NULL);
+    const int col0 = 16;
+    const int col1 = 126;
+    const int ctrlW = 270;
+    const int rowH = 26;
 
-            SendMessage(hw, WM_SETFONT, (WPARAM)hFont, TRUE);
-            return hw;
-        };
+    int y = 10;
 
-    //
-    // Layout (clean spacing)
-    //
-    int leftLabelX = 20;
-    int editX = 100;
-    int editW = 220;
+    lbl_np(L"Connection", col0, y, CW - col0 * 2, 17, true);
+    y += 20;
 
-    lbl(L"Host IP:", leftLabelX, 22, 70, 18);
-    hEditIP = edt(L"192.168.1.5", ID_EDIT_IP, editX, 20, editW, 22);
+    lbl_np(L"Host / IP:", col0, y + 3, col1 - col0 - 4, 17);
+    hEditIP = edt(L"", ID_EDIT_IP, col1, y, ctrlW, 22);
 
-    lbl(L"Your name:", leftLabelX, 55, 70, 18);
-    hEditName = edt(L"Controller", ID_EDIT_NAME, editX, 53, editW, 22);
+    hIpGhost = CreateWindowW(L"STATIC", L"e.g.  192.168.1.10",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_NOTIFY,
+        col1 + 4, y + 4, ctrlW - 8, 16,
+        hConnectWnd, (HMENU)(INT_PTR)ID_EDIT_IP_GHOST, hInst, NULL);
+    {
+        HFONT hfItalic = CreateFontW(
+            -MulDiv(8, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+            0, 0, 0, FW_NORMAL, TRUE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        if (!hfItalic) hfItalic = hfNormal;
+        SendMessage(hIpGhost, WM_SETFONT, (WPARAM)hfItalic, TRUE);
+    }
+    y += rowH;
 
-    hChkDebug = CreateWindowW(
-        L"BUTTON", L"Show debug panel on connect",
+    lbl_np(L"Your name:", col0, y + 3, col1 - col0 - 4, 17);
+    hEditName = edt(L"Controller", ID_EDIT_NAME, col1, y, ctrlW, 22);
+    y += rowH + 4;
+
+    CreateWindowW(L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        col0, y, CW - col0 * 2, 2, hConnectWnd, NULL, hInst, NULL);
+    y += 6;
+    lbl_np(L"Network Ports", col0, y, CW - col0 * 2, 17, true);
+    y += 20;
+
+    lbl_np(L"Video port:", col0, y + 3, col1 - col0 - 4, 17);
+    edt(L"55000", ID_EDIT_VPORT, col1, y, 88, 22, ES_NUMBER);
+    y += rowH;
+
+    lbl_np(L"Input port:", col0, y + 3, col1 - col0 - 4, 17);
+    edt(L"55001", ID_EDIT_IPORT, col1, y, 88, 22, ES_NUMBER);
+    y += rowH;
+
+    chk(L"WAN Discovery  (hostname or public IP)",
+        ID_CHK_INTERNET, col1, y, ctrlW, 20);
+    y += rowH + 4;
+
+    CreateWindowW(L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        col0, y, CW - col0 * 2, 2, hConnectWnd, NULL, hInst, NULL);
+    y += 6;
+    lbl_np(L"Encryption", col0, y, CW - col0 * 2, 17, true);
+    y += 20;
+
+    lbl_np(L"Passphrase:", col0, y + 3, col1 - col0 - 4, 17);
+    edt(L"", ID_EDIT_PASS, col1, y, ctrlW, 22, ES_PASSWORD);
+    y += rowH;
+
+    lbl_np(L"Leave blank to disable encryption.", col1, y, ctrlW, 15);
+    y += 20;
+
+    hChkDebug = CreateWindowW(L"BUTTON", L"Show Debug Panel",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        editX, 85, 220, 20,
-        hConnectWnd, (HMENU)(INT_PTR)ID_BTN_DEBUG, hInst, NULL);
+        col1, y, ctrlW, 20,
+        hConnectWnd, (HMENU)(INT_PTR)ID_CHK_DEBUG, hInst, NULL);
+    SendMessage(hChkDebug, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+    y += rowH;
 
-    SendMessage(hChkDebug, WM_SETFONT, (WPARAM)hFont, TRUE);
+    hChkStartup = CreateWindowW(L"BUTTON",
+        L"Include Startup",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        col1, y, ctrlW, 20,
+        hConnectWnd, (HMENU)(INT_PTR)ID_CHK_STARTUP, hInst, NULL);
+    SendMessage(hChkStartup, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+    y += rowH + 4;
 
-    //
-    // Centered Connect button
-    //
-    int btnW = 190;
-    int btnH = 30;
-    int btnX = (clientW - btnW) / 2;
+    {
+        const int btnW = 230, btnH = 26;
+        HWND hExp = CreateWindowW(L"BUTTON",
+            L"Export Settings",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            (CW - btnW) / 2, y, btnW, btnH,
+            hConnectWnd, (HMENU)(INT_PTR)ID_BTN_EXPORT, hInst, NULL);
+        SendMessage(hExp, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+    }
+    y += 30 + 6;
 
-    hBtnConnect = btn(
-        L"Connect to Desktop",
-        ID_BTN_CONNECT,
-        btnX,
-        115,
-        btnW,
-        btnH);
+    {
+        const int btnW = 210, btnH = 34;
+        hBtnConnect = CreateWindowW(L"BUTTON", L"Connect to Desktop",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            (CW - btnW) / 2, y, btnW, btnH,
+            hConnectWnd, (HMENU)(INT_PTR)ID_BTN_CONNECT, hInst, NULL);
+        SendMessage(hBtnConnect, WM_SETFONT, (WPARAM)hfBold, TRUE);
+    }
 
-    //
-    // Remote cursor bitmap
-    //
     hCursorBmp = make_remote_cursor_bmp(CURSOR_SIZE);
-
     return true;
+}
+
+static LRESULT CALLBACK LoadingOverlayProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+
+    if (msg == WM_COMMAND && LOWORD(wp) == ID_OVERLAY_CANCEL) {
+        if (g_app && g_app->hConnectWnd)
+            PostMessage(g_app->hConnectWnd, WM_COMMAND,
+                MAKEWPARAM(ID_OVERLAY_CANCEL, BN_CLICKED), (LPARAM)lp);
+        return 0;
+    }
+    if (msg == WM_PAINT)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rc; GetClientRect(hWnd, &rc);
+        int cx = (rc.right - rc.left) / 2;
+
+        HBRUSH bgBrush = CreateSolidBrush(RGB(235, 235, 235));
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        if (g_app)
+        {
+            int spinAngle = g_app->spinAngle;
+            int R = 22;
+
+            int cy_spin = 54;
+
+            int dotR = 5;
+
+            for (int seg = 0; seg < 8; seg++)
+            {
+                double angleDeg = spinAngle + seg * 45.0;
+                double angleRad = angleDeg * 3.14159265 / 180.0;
+                int dx = (int)(R * cos(angleRad));
+                int dy = (int)(R * sin(angleRad));
+
+                int fade = 60 + seg * 25;
+                if (fade > 220) fade = 220;
+                COLORREF col = RGB(fade, fade, fade);
+
+                HBRUSH dotBrush = CreateSolidBrush(col);
+                HPEN   dotPen = CreatePen(PS_SOLID, 1, col);
+                HGDIOBJ oldPen = SelectObject(hdc, dotPen);
+                HGDIOBJ oldBrush = SelectObject(hdc, dotBrush);
+
+                Ellipse(hdc,
+                    cx + dx - dotR, cy_spin + dy - dotR,
+                    cx + dx + dotR, cy_spin + dy + dotR);
+
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBrush);
+                DeleteObject(dotBrush);
+                DeleteObject(dotPen);
+            }
+        }
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wp, lp);
+}
+
+void ControllerApp::show_loading_overlay()
+{
+    if (hLoadingWnd) return;
+
+    HINSTANCE hInst = hInstance;
+    HFONT hfNormal = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    const wchar_t* OVCLS = L"RDLoadingOverlay";
+    WNDCLASSEXW wco{};
+    wco.cbSize = sizeof(wco);
+    wco.lpfnWndProc = LoadingOverlayProc;
+    wco.hInstance = hInst;
+    wco.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wco.hCursor = LoadCursor(NULL, IDC_WAIT);
+    wco.lpszClassName = OVCLS;
+    RegisterClassExW(&wco);
+
+    RECT cr; GetClientRect(hConnectWnd, &cr);
+    int ow = cr.right - cr.left;
+    int oh = cr.bottom - cr.top;
+
+    hLoadingWnd = CreateWindowExW(
+        0, OVCLS, NULL,
+        WS_CHILD | WS_VISIBLE,
+        0, 0, ow, oh,
+        hConnectWnd, NULL, hInst, NULL);
+
+    if (!hLoadingWnd) return;
+
+    EnumChildWindows(hConnectWnd, [](HWND child, LPARAM) -> BOOL {
+        if (child != g_app->hLoadingWnd)
+            EnableWindow(child, FALSE);
+        return TRUE;
+        }, 0);
+
+    int cx = ow / 2;
+    hLoadingLabel = CreateWindowW(L"STATIC", L"Connecting...",
+        WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
+        cx - 110, 88, 220, 20,
+        hLoadingWnd, NULL, hInst, NULL);
+    SendMessage(hLoadingLabel, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+
+    hLoadingLate = CreateWindowW(L"STATIC", L"Still attempting connection...",
+        WS_CHILD | SS_CENTER | SS_NOPREFIX,
+
+        cx - 130, 114, 260, 18,
+        hLoadingWnd, NULL, hInst, NULL);
+    SendMessage(hLoadingLate, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+
+    hLoadingCancel = CreateWindowW(L"BUTTON", L"Cancel",
+        WS_CHILD | BS_PUSHBUTTON,
+
+        cx - 50, 140, 100, 28,
+        hLoadingWnd, (HMENU)(INT_PTR)ID_OVERLAY_CANCEL, hInst, NULL);
+    SendMessage(hLoadingCancel, WM_SETFONT, (WPARAM)hfNormal, TRUE);
+
+    spinAngle = 0;
+    g_connect_cancelled = false;
+
+    SetTimer(hConnectWnd, ID_OVERLAY_TIMER, 60, NULL);
+
+    SetTimer(hConnectWnd, ID_OVERLAY_LATE_TIMER, 5000, NULL);
+
+    BringWindowToTop(hLoadingWnd);
+    UpdateWindow(hConnectWnd);
+}
+
+void ControllerApp::hide_loading_overlay()
+{
+    KillTimer(hConnectWnd, ID_OVERLAY_TIMER);
+    KillTimer(hConnectWnd, ID_OVERLAY_LATE_TIMER);
+
+    if (hLoadingWnd) {
+        DestroyWindow(hLoadingWnd);
+        hLoadingWnd = NULL;
+        hLoadingLabel = NULL;
+        hLoadingLate = NULL;
+        hLoadingCancel = NULL;
+    }
+
+    EnumChildWindows(hConnectWnd, [](HWND child, LPARAM) -> BOOL {
+        EnableWindow(child, TRUE);
+        return TRUE;
+        }, 0);
+}
+
+void ControllerApp::tick_spinner()
+{
+    spinAngle = (spinAngle + 15) % 360;
+    if (hLoadingWnd) {
+
+        RECT spinRect = { 0, 20, 999, 85 };
+        InvalidateRect(hLoadingWnd, &spinRect, TRUE);
+    }
+}
+
+void ControllerApp::show_late_label()
+{
+    if (!hLoadingWnd) return;
+    if (hLoadingLate) { ShowWindow(hLoadingLate, SW_SHOW); UpdateWindow(hLoadingLate); }
+    if (hLoadingCancel) { ShowWindow(hLoadingCancel, SW_SHOW); UpdateWindow(hLoadingCancel); }
+}
+
+void ControllerApp::cancel_connect()
+{
+    g_connect_cancelled = true;
+    hide_loading_overlay();
+
+    EnableWindow(hBtnConnect, TRUE);
+    ShowWindow(hConnectWnd, SW_SHOW);
+    SetForegroundWindow(hConnectWnd);
 }
 
 void ControllerApp::create_session_window()
@@ -980,12 +1414,13 @@ void ControllerApp::create_session_window()
         WS_CHILD | WS_VISIBLE,
         0, 36, scrW / 2, scrH / 2 - 36 - 22, hSessionWnd, NULL, hInst, NULL);
 
-    hStatusBar = CreateWindowW(L"STATIC", L"Connected",
+    const wchar_t* connStatus = g_aes_enabled ? L"Connected  [AES-128-CTR encrypted]" : L"Connected  [Unencrypted]";
+    hStatusBar = CreateWindowW(L"STATIC", connStatus,
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_SUNKEN,
         0, scrH / 2 - 22, scrW / 2, 22, hSessionWnd, NULL, hInst, NULL);
     SendMessage(hStatusBar, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    if (SendMessage(hChkDebug, BM_GETCHECK, 0, 0) == BST_CHECKED)
+    if (hChkDebug && SendMessage(hChkDebug, BM_GETCHECK, 0, 0) == BST_CHECKED)
         toggle_debug();
 
     ShowWindow(hSessionWnd, SW_SHOW);
@@ -1024,47 +1459,189 @@ void ControllerApp::on_connect()
 {
     if (!show_consent_dialog()) return;
 
-    wchar_t ip_buf[64] = {}, name_buf[64] = {};
-    GetWindowTextW(hEditIP, ip_buf, 64);
+    wchar_t ip_buf[128] = {}, name_buf[64] = {}, vport_buf[8] = {}, iport_buf[8] = {}, pass_buf[128] = {};
+    GetWindowTextW(hEditIP, ip_buf, 128);
     GetWindowTextW(hEditName, name_buf, 64);
+
+    HWND hVportEdit = GetDlgItem(hConnectWnd, ID_EDIT_VPORT);
+    HWND hIportEdit = GetDlgItem(hConnectWnd, ID_EDIT_IPORT);
+    HWND hPassEdit = GetDlgItem(hConnectWnd, ID_EDIT_PASS);
+    if (hVportEdit) GetWindowTextW(hVportEdit, vport_buf, 8);
+    if (hIportEdit) GetWindowTextW(hIportEdit, iport_buf, 8);
+    if (hPassEdit)  GetWindowTextW(hPassEdit, pass_buf, 128);
+
+    int vport = _wtoi(vport_buf);
+    int iport = _wtoi(iport_buf);
+    if (vport < 1024 || vport > 65535) vport = 55000;
+    if (iport < 1024 || iport > 65535) iport = 55001;
+
+    VIDEO_PORT = vport;
+    INPUT_PORT = iport;
+
+    std::wstring wpass(pass_buf);
+    std::string passphrase(wpass.begin(), wpass.end());
+    if (!passphrase.empty()) {
+        uint8_t key[16];
+        AES128::DeriveKey(passphrase, key);
+        AES128::KeyExpansion(key, g_aes_ctx.rk);
+        g_aes_enabled = true;
+    }
+    else {
+        g_aes_enabled = false;
+    }
+
+    g_aes_inp_send_ctr = 0;
+    g_aes_vid_recv_ctr = 0;
 
     std::wstring wip(ip_buf), wname(name_buf);
     std::string  host(wip.begin(), wip.end());
     std::string  name = wname.empty() ? "Controller"
         : std::string(wname.begin(), wname.end());
     if (host.empty()) {
-        MessageBoxW(hConnectWnd, L"Please enter the host IP address.", L"Error", MB_OK | MB_ICONERROR);
+        MessageBoxW(hConnectWnd, L"Please enter the host IP address or hostname.", L"Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    set_status("Connecting...");
+    HWND hChkInet = GetDlgItem(hConnectWnd, ID_CHK_INTERNET);
+    bool over_internet = hChkInet &&
+        (SendMessage(hChkInet, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    if (over_internet) {
+        bool looks_lan = false;
+
+        if (host.size() > 8) {
+            if (host.substr(0, 8) == "192.168." ||
+                host.substr(0, 3) == "10." ||
+                host == "localhost" ||
+                host.substr(0, 10) == "172.16." ||
+                host.substr(0, 10) == "172.17." ||
+                host.substr(0, 10) == "172.18." ||
+                host.substr(0, 10) == "172.19." ||
+                host.substr(0, 10) == "172.20." ||
+                host.substr(0, 10) == "172.31.")
+                looks_lan = true;
+        }
+        else if (host.substr(0, 3) == "10.") {
+            looks_lan = true;
+        }
+        if (looks_lan) {
+            int r = MessageBoxW(hConnectWnd,
+                L"'Over the Internet' is checked, but the host looks like a LAN IP.\n\n"
+                L"For internet connections, enter the host's public IP or hostname\n"
+                L"(e.g. mypc.ddns.net). Continue anyway?",
+                L"Check Host Address",
+                MB_YESNO | MB_ICONWARNING);
+            if (r != IDYES) return;
+        }
+    }
+
     EnableWindow(hBtnConnect, FALSE);
+    show_loading_overlay();
 
     HWND postTarget = hConnectWnd;
 
-    std::thread([this, host, name, postTarget]() {
-
-        auto* hstat = new std::string("Connecting input channel...");
-        PostMessage(postTarget, WM_APP_STATUS, 0, (LPARAM)hstat);
+    std::thread([this, host, name, postTarget, vport, iport, over_internet]() {
 
         auto ic = std::make_unique<InputConnection>(host);
-        if (!ic->connect()) {
+        ic->input_port = iport;
+
+        auto nb_connect = [&](int port) -> SOCKET
+            {
+
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons((u_short)port);
+                struct addrinfo hints {}, * res = nullptr;
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                char portstr[8]; sprintf_s(portstr, "%d", port);
+                if (getaddrinfo(host.c_str(), portstr, &hints, &res) == 0 && res) {
+                    addr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
+                    addr.sin_port = htons((u_short)port);
+                    freeaddrinfo(res);
+                }
+                else {
+                    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
+                        return INVALID_SOCKET;
+                }
+
+                SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+                u_long nb = 1;
+                ioctlsocket(s, FIONBIO, &nb);
+
+                ::connect(s, (sockaddr*)&addr, sizeof(addr));
+
+                int max_slices = over_internet ? 200 : 60;
+                for (int slice = 0; slice < max_slices && !g_connect_cancelled; ++slice) {
+                    timeval tv{}; tv.tv_usec = 50000;
+
+                    fd_set wset, eset;
+                    FD_ZERO(&wset); FD_SET(s, &wset);
+                    FD_ZERO(&eset); FD_SET(s, &eset);
+                    int r = select(0, NULL, &wset, &eset, &tv);
+                    if (r > 0 && FD_ISSET(s, &wset)) {
+
+                        int err = 0; int elen = sizeof(err);
+                        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+                        if (err != 0) break;
+
+                        u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);
+                        BOOL nd = 1;
+                        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+                        return s;
+
+                    }
+                    if (r < 0 || FD_ISSET(s, &eset)) break;
+
+                }
+
+                closesocket(s);
+                return INVALID_SOCKET;
+            };
+
+        bool inputOk = false;
+        {
+            int deadline_sec = over_internet ? 300 : 60;
+            auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(deadline_sec);
+            while (!g_connect_cancelled &&
+                std::chrono::steady_clock::now() < deadline)
+            {
+                SOCKET s = nb_connect(iport);
+                if (g_connect_cancelled) {
+                    if (s != INVALID_SOCKET) closesocket(s);
+                    break;
+                }
+                if (s != INVALID_SOCKET) {
+                    ic->sock = s;
+                    ic->running = true;
+                    inputOk = true;
+                    break;
+                }
+
+                for (int i = 0; i < 10 && !g_connect_cancelled; ++i)
+                    Sleep(50);
+            }
+        }
+
+        if (g_connect_cancelled) return;
+
+        if (!inputOk) {
+            PostMessage(postTarget, WM_APP_CONN_CANCEL, 0, 0);
             PostMessage(postTarget, WM_APP_STATUS, 0,
                 (LPARAM)new std::string("Failed: could not connect input channel"));
-            PostMessage(postTarget, WM_APP_DISCONN, 0, 0);
             return;
         }
 
-        PostMessage(postTarget, WM_APP_STATUS, 0,
-            (LPARAM)new std::string("Waiting for host approval..."));
+        if (g_connect_cancelled) { ic->disconnect(); return; }
 
         auto vc = std::make_unique<VideoConnection>(host, name);
+        vc->video_port = vport;
 
         vc->frame_callback = [this](PendingFrame pf) {
-
-            HWND fw = hSessionWnd ? hSessionWnd : hConnectWnd;
             on_frame(std::move(pf));
-            (void)fw;
             };
         vc->status_callback = [this, postTarget](std::string msg) {
             HWND target = hSessionWnd ? hSessionWnd : postTarget;
@@ -1073,11 +1650,14 @@ void ControllerApp::on_connect()
             };
 
         auto [ok, msg] = vc->connect_video();
+
+        if (g_connect_cancelled) { ic->disconnect(); return; }
+
         if (!ok) {
             ic->disconnect();
+            PostMessage(postTarget, WM_APP_CONN_CANCEL, 0, 0);
             PostMessage(postTarget, WM_APP_STATUS, 0,
                 (LPARAM)new std::string("Failed: " + msg));
-            PostMessage(postTarget, WM_APP_DISCONN, 0, 0);
             return;
         }
 
@@ -1096,6 +1676,8 @@ void ControllerApp::on_disconnected()
     ShowWindow(hConnectWnd, SW_SHOW);
     SetForegroundWindow(hConnectWnd);
     hwnd = hConnectWnd;
+
+    hide_loading_overlay();
 
     set_status("Disconnected — ready to reconnect");
     EnableWindow(hBtnConnect, TRUE);
@@ -1390,7 +1972,6 @@ void ControllerApp::raw_input_loop()
     DestroyWindow(hw);
     UnregisterClassW(CLS, hInstance);
 }
-
 void ControllerApp::handle_raw_input(LPARAM lp)
 {
     if (!cursor_locked || !input_conn) return;
@@ -1490,10 +2071,12 @@ static LRESULT CALLBACK DebugWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         int y = 30;
         for (int i = 0; i < DBG_ROWS; i++, y += 18) {
             hDebugLabels[i] = CreateWindowW(L"STATIC", DBG_NAMES[i],
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 5, y, 160, 16, hWnd, NULL, NULL, NULL);
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                5, y, 160, 16, hWnd, NULL, NULL, NULL);
             SendMessage(hDebugLabels[i], WM_SETFONT, (WPARAM)hf, TRUE);
-            hDebugVals[i] = CreateWindowW(L"STATIC", L"—",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 170, y, 220, 16, hWnd, NULL, NULL, NULL);
+            hDebugVals[i] = CreateWindowW(L"STATIC", L"-",
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                170, y, 220, 16, hWnd, NULL, NULL, NULL);
             SendMessage(hDebugVals[i], WM_SETFONT, (WPARAM)hf, TRUE);
         }
         HWND hReset = CreateWindowW(L"BUTTON", L"Reset counters",
@@ -1516,6 +2099,9 @@ static LRESULT CALLBACK DebugWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
 void ControllerApp::toggle_debug()
 {
+
+    if (!hSessionWnd) return;
+
     if (debugVisible) {
         debugVisible = false;
         if (hDebugWin) { DestroyWindow(hDebugWin); hDebugWin = NULL; }
@@ -1534,8 +2120,8 @@ void ControllerApp::toggle_debug()
             WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
             50, 50, 410, 30 + DBG_ROWS * 18 + 40, NULL, NULL, hInstance, NULL);
 
-        HWND hTitle = CreateWindowW(L"STATIC", L" CONTROLLER DEBUG ",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
+        HWND hTitle = CreateWindowW(L"STATIC", L"CONTROLLER DEBUG",
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
             0, 0, 410, 24, hDebugWin, NULL, NULL, NULL);
         HFONT hf = CreateFontW(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1591,6 +2177,118 @@ void ControllerApp::update_debug()
         SetTimer(hDebugWin, 1, 200, [](HWND, UINT, UINT_PTR, DWORD) {
         if (g_app) g_app->update_debug();
             });
+}
+
+void ControllerApp::export_settings()
+{
+
+    wchar_t vport_buf[8] = {}, iport_buf[8] = {}, pass_buf[128] = {};
+    HWND hVp = GetDlgItem(hConnectWnd, ID_EDIT_VPORT);
+    HWND hIp = GetDlgItem(hConnectWnd, ID_EDIT_IPORT);
+    HWND hPa = GetDlgItem(hConnectWnd, ID_EDIT_PASS);
+    if (hVp) GetWindowTextW(hVp, vport_buf, 8);
+    if (hIp) GetWindowTextW(hIp, iport_buf, 8);
+    if (hPa) GetWindowTextW(hPa, pass_buf, 128);
+
+    int vport = _wtoi(vport_buf);
+    int iport = _wtoi(iport_buf);
+    if (vport < 1024 || vport > 65535) vport = 55000;
+    if (iport < 1024 || iport > 65535) iport = 55001;
+
+    std::wstring wpass(pass_buf);
+    std::string  passphrase(wpass.begin(), wpass.end());
+
+    if (vport == iport) {
+        MessageBoxW(hConnectWnd,
+            L"Video port and Input port must be different before exporting.",
+            L"Export Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    wchar_t filePath[MAX_PATH] = L"settings.dat";
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hConnectWnd;
+    ofn.lpstrFilter = L"Settings file (*.dat)\0*.dat\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"dat";
+    ofn.lpstrFile = filePath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Save settings.dat for Host Agent";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    char narrowPath[MAX_PATH] = {};
+    WideCharToMultiByte(CP_ACP, 0, filePath, -1, narrowPath, MAX_PATH, NULL, NULL);
+
+    std::ofstream f(narrowPath, std::ios::trunc);
+    if (!f.is_open()) {
+        MessageBoxW(hConnectWnd,
+            L"Could not write the file. Check that the destination is writable.",
+            L"Export Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    HWND hChkInet = GetDlgItem(hConnectWnd, ID_CHK_INTERNET);
+    bool wan_mode = hChkInet &&
+        (SendMessage(hChkInet, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    const char* conn_str = wan_mode ? "WAN" : "LAN";
+
+    f << "# Remote Desktop Host Agent - Configuration\n";
+    f << "# Generated by Remote Desktop Controller\n";
+    f << "# Place this file in the same folder as Client.exe\n";
+    f << "#\n";
+    f << "video_port = " << vport << "\n";
+    f << "input_port = " << iport << "\n";
+    f << "connection = " << conn_str << "\n";
+
+    bool inc_startup = hChkStartup &&
+        (SendMessage(hChkStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (inc_startup)
+        f << "startup = true\n";
+    else
+        f << "# startup = true    (uncomment to register agent in Windows startup)\n";
+    if (!passphrase.empty())
+        f << "passphrase = " << passphrase << "\n";
+    else
+        f << "# passphrase =    (encryption disabled - uncomment and set a value to enable)\n";
+
+    f.close();
+
+    std::wstring wconn = wan_mode ? L"WAN (UPnP port forwarding enabled)" : L"LAN (no port forwarding)";
+    std::wstring confirm =
+        L"settings.dat exported successfully.\n\n"
+        L"Place it in the same folder as Client.exe on the host machine.\n\n"
+        L"Settings written:\n"
+        L"  video_port  = " + std::to_wstring(vport) + L"\n"
+        L"  input_port  = " + std::to_wstring(iport) + L"\n"
+        L"  connection  = " + wconn + L"\n"
+        L"  startup     = " + std::wstring(inc_startup ? L"true" : L"false (commented out)") + L"\n" +
+        (passphrase.empty()
+            ? L"  passphrase  = (none - encryption disabled)"
+            : L"  passphrase  = " + std::wstring(passphrase.begin(), passphrase.end()));
+
+    MessageBoxW(hConnectWnd, confirm.c_str(),
+        L"Export Successful", MB_OK | MB_ICONINFORMATION);
+}
+
+void ControllerApp::update_ip_placeholder()
+{
+    if (!hIpGhost || !hEditIP) return;
+
+    HWND hChkInet = GetDlgItem(hConnectWnd, ID_CHK_INTERNET);
+    bool wan = hChkInet &&
+        (SendMessage(hChkInet, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    SetWindowTextW(hIpGhost,
+        wan ? L"e.g.  mypc.ddns.net  or  203.0.113.5"
+        : L"e.g.  192.168.1.10");
+
+    wchar_t buf[4] = {};
+    GetWindowTextW(hEditIP, buf, 4);
+    bool empty = (buf[0] == L'\0');
+    ShowWindow(hIpGhost, empty ? SW_SHOW : SW_HIDE);
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
