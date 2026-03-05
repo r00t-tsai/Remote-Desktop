@@ -410,10 +410,11 @@ static HDESK SwitchToInputDesktop()
 
     SetThreadDesktop(hInputDesk);
     CloseDesktop(hInputDesk);
-    return hCurDesk;
+    return hCurDesk;  
 }
 
 static std::vector<uint8_t> CaptureScreenJpeg() {
+
     HDESK hPrevDesk = SwitchToInputDesktop();
 
     HDC hdcScr = GetDC(NULL);
@@ -662,6 +663,7 @@ static void HeartbeatThread() {
 
 static void InputThread() {
     Log("INPUT: Listening\n");
+
     typedef VOID(WINAPI* PFN_SendSAS)(BOOL asUser);
     static PFN_SendSAS pfnSendSAS = nullptr;
     if (!pfnSendSAS) {
@@ -738,7 +740,7 @@ static void InputThread() {
 
             if (vk == VK_DELETE && pressed && ctrl_down && alt_down) {
                 if (pfnSendSAS) {
-                    pfnSendSAS(FALSE);
+                    pfnSendSAS(FALSE); 
                     Log("INPUT: SendSAS triggered\n");
                 }
                 else {
@@ -755,7 +757,7 @@ static void InputThread() {
                     SendInput(3, sas, sizeof(INPUT));
                     Log("INPUT: Ctrl+Alt+Del fallback injected\n");
                 }
-                continue;  
+                continue;
             }
 
             WORD sc = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -1338,8 +1340,108 @@ static void HandleStartupRegistration()
     }
 }
 
+static bool IsRunningAsAdmin()
+{
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &adminGroup))
+    {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin == TRUE;
+}
+
+static void RelaunchAsAdmin()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void CheckAndWarnSASRegistry()
+{
+    HKEY hKey = NULL;
+    LONG res = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        0, KEY_READ, &hKey);
+
+    bool sasOk = false;
+    if (res == ERROR_SUCCESS) {
+        DWORD val = 0, sz = sizeof(val), type = 0;
+        res = RegQueryValueExW(hKey, L"SoftwareSASGeneration",
+            NULL, &type, (LPBYTE)&val, &sz);
+        if (res == ERROR_SUCCESS && val >= 1)
+            sasOk = true;
+        RegCloseKey(hKey);
+    }
+
+    if (!sasOk) {
+        int choice = MessageBoxW(NULL,
+            L"The registry key required for Ctrl+Alt+Del (SendSAS) support was not found.\n\n"
+            L"Without it, the remote Ctrl+Alt+Del function will not work.\n\n"
+            L"Key:   HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\n"
+            L"Value: SoftwareSASGeneration = 1\n\n"
+            L"Click OK to add it automatically now.\n"
+            L"Click Cancel to skip (Ctrl+Alt+Del forwarding will be disabled).",
+            L"Remote Desktop Host \x2014 SendSAS Registry Key Missing",
+            MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+
+        if (choice == IDOK) {
+            HKEY hWrite = NULL;
+            LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                0, NULL, REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE, NULL, &hWrite, NULL);
+            if (r == ERROR_SUCCESS) {
+                DWORD val = 1;
+                RegSetValueExW(hWrite, L"SoftwareSASGeneration",
+                    0, REG_DWORD, (LPBYTE)&val, sizeof(val));
+                RegCloseKey(hWrite);
+                MessageBoxW(NULL,
+                    L"Registry key added successfully.\n\n"
+                    L"Ctrl+Alt+Del forwarding is now enabled.",
+                    L"Remote Desktop Host \x2014 Registry Updated",
+                    MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+                Log("HOST: SoftwareSASGeneration registry key added\n");
+            }
+            else {
+                MessageBoxW(NULL,
+                    L"Failed to write the registry key.\n\n"
+                    L"Please add it manually via an elevated Command Prompt:\n\n"
+                    L"reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" "
+                    L"/v SoftwareSASGeneration /t REG_DWORD /d 1 /f",
+                    L"Remote Desktop Host \x2014 Registry Write Failed",
+                    MB_OK | MB_ICONERROR | MB_TOPMOST);
+                Log("HOST: Failed to write SoftwareSASGeneration registry key\n");
+            }
+        }
+        else {
+            Log("HOST: User skipped SoftwareSASGeneration registry key\n");
+        }
+    }
+}
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+    if (!IsRunningAsAdmin()) {
+        int choice = MessageBoxW(NULL,
+            L"Remote Desktop Host must be run as Administrator.\n\n"
+            L"This is required for:\n"
+            L"  \x2022  Capturing the UAC / Secure Desktop screen\n"
+            L"  \x2022  Sending Ctrl+Alt+Del to the remote machine\n"
+            L"  \x2022  Injecting keyboard and mouse input globally\n\n"
+            L"Click OK to restart as Administrator now.\n"
+            L"Click Cancel to exit.",
+            L"Remote Desktop Host \x2014 Administrator Required",
+            MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        if (choice == IDOK)
+            RelaunchAsAdmin();
+        return 1;
+    }
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\RemoteDesktopHost_SingleInstance");
     if (hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(NULL,
@@ -1352,6 +1454,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     }
 
     LogInit();
+    CheckAndWarnSASRegistry();
 
     HostConfig cfg;
     std::string settingsError;
