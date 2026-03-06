@@ -5,7 +5,7 @@ This is one of my side projects back then that I forgot to upload when I was sti
 
 ## Components
 ### Host
-* Listens for incoming connections on TCP ports 55000 (video) and 55001 (input).
+* Listens for incoming connections on TCP ports 55000 (video) and 55001 (input). These values are the default ones, you can configure those yourself.
 * Streams the desktop using GDI+ JPEG compression.
 * Injects received mouse and keyboard commands into the system.
 * Captures audio stream directly from the default playback device.
