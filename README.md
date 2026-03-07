@@ -7,29 +7,14 @@
 </div>
 A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen, listen to audio playbacks, and control the mouse and keyboard of another machine over WAN/LAN. 
 
-## Components
-### Host
-* Listens for incoming connections on TCP ports 55000 (video) and 55001 (input). These values are the default ones, you can configure those yourself.
-* Streams the desktop using GDI+ JPEG compression.
-* Injects received mouse and keyboard commands into the system.
-* Captures audio stream directly from the default playback device.
-
-### Dashboard Client
-* GUI to enter the target Host IP and your connection name.
-* Uses Raw Input and Low-Level Keyboard Hooks to capture your mouse and keystrokes and sends them to the host program.
-* Exports Host configuration settings.
-* Takes the audio data streamed from the Host and plays it through the speakers using Windows multimedia APIs.
-
-> ## TO-DO LIST for v1.1.4
-> 
-> * Implement support for UAC Popups and Windows Security Screen
-
 ## Building
 ### Compiler: Microsoft Visual C++ (MSVC) is highly recommended.
 #### Libraries:
 *  `ws2_32.lib, gdi32.lib, gdiplus.lib, user32.lib ` will automatically link if you compile with MSVC.
-#### CPP Standard: 
-* `std::thread, std::mutex, and std::atomic.` found in C++14 (C++17 recommended).
+
+> ## TO-DO LIST for v1.1.4
+> 
+> * Implement support for UAC Popups and Windows Security Screen
 
 ## Usage Instructions:
 - CONNECT TO A DEVICE
