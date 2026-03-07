@@ -341,15 +341,15 @@ static const int   FPS_TARGET = 30;
 struct BandwidthController {
     static constexpr ULONG QUALITY_LADDER[4] = { 15, 30, 50, 75 };
     static constexpr int   LADDER_LEN = 4;
-    static constexpr int   DEFAULT_IDX = 2; 
+    static constexpr int   DEFAULT_IDX = 2;
     static constexpr double FRAME_BUDGET_MS = 1000.0 / FPS_TARGET;
     static constexpr int STEP_UP_FRAMES = 10;
     static constexpr int COOLDOWN_FRAMES = 5;
     static constexpr double EMA_ALPHA = 0.25;
 
     int    quality_idx = DEFAULT_IDX;
-    int    fast_streak = 0;     
-    int    cooldown_left = 0;      
+    int    fast_streak = 0;
+    int    cooldown_left = 0;
     double ema_send_ms = FRAME_BUDGET_MS * 0.5;
     long long total_bytes_sent = 0;
     int    frame_count = 0;
@@ -479,7 +479,7 @@ static HDESK SwitchToInputDesktop()
 
     SetThreadDesktop(hInputDesk);
     CloseDesktop(hInputDesk);
-    return hCurDesk; 
+    return hCurDesk;
 }
 
 static std::vector<uint8_t> CaptureScreenJpeg(ULONG jpeg_quality = 50) {
@@ -897,7 +897,7 @@ static void InputThread() {
                     SendInput(3, sas, sizeof(INPUT));
                     Log("INPUT: Ctrl+Alt+Del fallback injected\n");
                 }
-                continue;  
+                continue;
             }
 
             WORD sc = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -946,7 +946,7 @@ static void AddTrayIcon(HWND hwnd) {
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAY_ICON;
     g_nid.hIcon = LoadIcon(NULL, IDI_INFORMATION);
-    wcscpy_s(g_nid.szTip, L"Remote Desktop - Session Active");
+    wcscpy_s(g_nid.szTip, L"Remote Desktop Session | Active");
     Shell_NotifyIcon(NIM_ADD, &g_nid); g_tray_added = true;
 }
 static void RemoveTrayIcon() {
@@ -1030,7 +1030,7 @@ static void RunStatusWindow() {
     int scrH = GetSystemMetrics(SM_CYSCREEN);
 
     HWND hwnd = CreateWindowExW(exStyle, L"RemoteHostStatus",
-        L"Remote Desktop - Session Active", WS_POPUP,
+        L"Remote Desktop | Session Active", WS_POPUP,
         10, scrH - winH - 10, winW, winH,
         NULL, NULL, hInst, NULL);
 
@@ -1467,7 +1467,7 @@ static void HandleStartupRegistration()
         L"This host is configured to register in Windows Startup\n"
         L"Do you want to add it to your startup apps?\n\n"
         L"(You can remove it later via Task Manager > Startup Apps)",
-        L"Remote Desktop Host - Startup Registration",
+        L"Remote Desktop Host | Startup Registration",
         MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
 
     if (answer == IDYES) {
@@ -1588,7 +1588,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         MessageBoxW(NULL,
             L"Remote Desktop Host is already running.\n\n"
             L"Only one instance may run at a time.",
-            L"Remote Desktop Host - Already Running",
+            L"Remote Desktop Host | Already Running",
             MB_OK | MB_ICONWARNING | MB_TOPMOST);
         if (hMutex) ReleaseMutex(hMutex), CloseHandle(hMutex);
         return 1;
