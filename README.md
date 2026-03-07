@@ -3,7 +3,7 @@
 </div>
 
 <div align="center">
-  <h1>Simple C++ Remote Desktop Protocol</h1>
+  <h1>Simple Remote Desktop</h1>
 </div>
 A lightweight remote desktop application built entirely in C++ for Windows. It allows you to view the screen, listen to audio playbacks, and control the mouse and keyboard of another machine over WAN/LAN. 
 
