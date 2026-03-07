@@ -9,12 +9,6 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 
 ## Building
 ### Compiler: Microsoft Visual C++ (MSVC) is highly recommended.
-#### Libraries:
-*  `ws2_32.lib, gdi32.lib, gdiplus.lib, user32.lib ` will automatically link if you compile with MSVC.
-
-> ## TO-DO LIST for v1.1.4
-> 
-> * Implement support for UAC Popups and Windows Security Screen
 
 ## Usage Instructions:
 - CONNECT TO A DEVICE
@@ -30,7 +24,9 @@ A lightweight remote desktop application built entirely in C++ for Windows. It a
 4. Enter the encryption key for your private connection.
 5. Click Start Host.
 > Side Note: If on WAN Mode, your router must be configured to do Port Forwarding. The Program assumes this condition and will spit errors if this condition is not met.
-
+> ## TO-DO LIST for v1.1.4
+> 
+> * Implement support for UAC Popups and Windows Security Screen
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/2a1bee6e-d966-4a84-b1d4-9d6f2e521f3b" width="800" controls></video>
